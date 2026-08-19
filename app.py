@@ -107,53 +107,70 @@ def get_all_tasks(start_date, end_date):
     }
 
 
-def classify_task(task_name, task_description):
-    search_text = normalize_text(task_name + " " + task_description)
-    compact_text = search_text.replace(" ", "")
+def classify_task_by_name_only(task_name):
+    """
+    SAFETY RULE:
+    Only the task NAME/TITLE controls deployment.
+
+    Task notes/descriptions are ignored for Vapi eligibility.
+
+    Plain RELS PC is blacklisted from Vapi unless VAPI is written
+    directly in the task name.
+    """
+    name_text = normalize_text(task_name)
+    compact_name = name_text.replace(" ", "")
 
     has_vapi_new = (
-        "VAPI NEW" in search_text
-        or "VAPINEW" in compact_text
+        "VAPI NEW" in name_text
+        or "VAPINEW" in compact_name
     )
 
-    has_vapi = "VAPI" in search_text or "VAPI" in compact_text
+    has_vapi = (
+        "VAPI" in name_text
+        or "VAPI" in compact_name
+    )
 
     has_rels_pc = (
-        "RELS PC" in search_text
-        or "RELSPC" in compact_text
+        "RELS PC" in name_text
+        or "RELSPC" in compact_name
     )
 
-    # Highest priority:
-    # VAPI NEW, vapi new, VAPI NEW RELS PC, vapi new rels pc
+    # Highest priority Vapi queue:
+    # VAPI NEW
+    # vapi new
+    # VAPI NEW RELS PC
     if has_vapi_new:
         return {
             "bucket": "deploy",
             "qualified_for_vapi": True,
             "priority_order": 1,
             "priority_label": "VAPI NEW",
-            "reason": "Highest priority Vapi deployment task"
+            "reason": "Highest priority Vapi deployment task. Task name contains VAPI NEW."
         }
 
-    # Regular Vapi deployment:
-    # VAPI, vapi, VAPI RELS PC, vapi rels pc
+    # Regular Vapi queue:
+    # VAPI
+    # vapi
+    # VAPI RELS PC
     if has_vapi:
         return {
             "bucket": "deploy",
             "qualified_for_vapi": True,
             "priority_order": 2,
             "priority_label": "VAPI",
-            "reason": "Regular Vapi deployment task"
+            "reason": "Regular Vapi deployment task. Task name contains VAPI."
         }
 
-    # Plain RELS PC is manual SMS/broadcast only.
-    # It is NOT eligible for Vapi unless VAPI is also written in the task.
+    # Plain RELS PC:
+    # manual SMS / broadcast only.
+    # blacklisted from Vapi.
     if has_rels_pc:
         return {
             "bucket": "manual_sms_only",
             "qualified_for_vapi": False,
             "priority_order": 50,
-            "priority_label": "RELS PC MANUAL",
-            "reason": "Manual SMS/broadcast only. Ignored by Vapi dispatcher."
+            "priority_label": "RELS PC BLACKLISTED",
+            "reason": "Plain RELS PC is manual SMS/broadcast only. Ignored by Vapi dispatcher."
         }
 
     return {
@@ -161,7 +178,7 @@ def classify_task(task_name, task_description):
         "qualified_for_vapi": False,
         "priority_order": 99,
         "priority_label": "IGNORE",
-        "reason": "Not a Vapi deployment task"
+        "reason": "Task name does not contain VAPI, VAPI NEW, or RELS PC."
     }
 
 
@@ -251,6 +268,7 @@ def crm_test():
     lead_section_tasks = []
     deploy_eligible_tasks = []
     manual_rels_pc_tasks = []
+    ignored_tasks = []
 
     vapi_new_count = 0
     vapi_regular_count = 0
@@ -264,9 +282,11 @@ def crm_test():
         lead_section_tasks.append(task)
 
         task_name = task.get("Name", "")
-        task_description = task.get("Description", "")
 
-        classification = classify_task(task_name, task_description)
+        # IMPORTANT:
+        # Deployment classification uses task name only.
+        # Description/note is intentionally ignored for safety.
+        classification = classify_task_by_name_only(task_name)
 
         task_preview = {
             "priority_order": classification["priority_order"],
@@ -292,6 +312,9 @@ def crm_test():
         elif classification["bucket"] == "manual_sms_only":
             manual_rels_pc_tasks.append(task_preview)
 
+        else:
+            ignored_tasks.append(task_preview)
+
     # VAPI NEW comes first, then regular VAPI.
     deploy_eligible_tasks.sort(key=lambda item: (
         item.get("priority_order", 99),
@@ -307,6 +330,7 @@ def crm_test():
     return jsonify({
         "crm_connection": "ok",
         "mode": "read-only",
+        "classification_source": "task_name_only",
         "lead_tasks_calendar_found": True,
         "lead_tasks_calendar_name": lead_tasks_calendar.get("Name"),
         "date_range_checked": {
@@ -320,16 +344,21 @@ def crm_test():
         "vapi_regular_tasks_found": vapi_regular_count,
         "deploy_eligible_vapi_tasks_found": len(deploy_eligible_tasks),
 
-        "manual_rels_pc_tasks_ignored_for_vapi": len(manual_rels_pc_tasks),
+        "manual_rels_pc_tasks_blacklisted_from_vapi": len(manual_rels_pc_tasks),
 
-        "deployment_priority_order": [
-            "1. VAPI NEW",
-            "2. VAPI",
-            "Plain RELS PC is manual only unless VAPI is added to the task name."
+        "rules": [
+            "Only task name/title controls Vapi deployment.",
+            "Task notes/descriptions do not trigger Vapi deployment.",
+            "VAPI NEW = deploy first.",
+            "VAPI = regular deploy.",
+            "Plain RELS PC = manual SMS/broadcast only and blacklisted from Vapi.",
+            "VAPI RELS PC = deploy eligible because VAPI is in the task name.",
+            "VAPI NEW RELS PC = deploy eligible first because VAPI NEW is in the task name."
         ],
 
         "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:25],
-        "manual_rels_pc_tasks_preview": manual_rels_pc_tasks[:10],
+        "manual_rels_pc_blacklist_preview": manual_rels_pc_tasks[:10],
+        "ignored_tasks_preview": ignored_tasks[:10],
 
         "safe": "No campaigns were created. No secret values are displayed."
     })
