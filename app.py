@@ -1,5 +1,5 @@
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 from flask import Flask, jsonify
@@ -73,14 +73,14 @@ def compact_text(value):
     return normalize_text(value).replace(" ", "")
 
 
-def get_today_tasks(today):
+def get_due_tasks(start_date, end_date):
     all_tasks = []
     page = 1
 
     while True:
         result = call_lacrm("GetTasks", {
-            "StartDate": today.isoformat(),
-            "EndDate": today.isoformat(),
+            "StartDate": start_date.isoformat(),
+            "EndDate": end_date.isoformat(),
             "CompletionStatus": "Incomplete",
             "MaxNumberOfResults": 500,
             "Page": page
@@ -218,6 +218,11 @@ def config_check():
 def crm_test():
     today = date.today()
 
+    # Your Workspace → Tasks that are due → LEAD TASKS
+    # means overdue tasks plus today's tasks.
+    start_date = today - timedelta(days=90)
+    end_date = today
+
     calendars_result = call_lacrm("GetCalendars")
 
     if not calendars_result["ok"]:
@@ -253,7 +258,7 @@ def crm_test():
 
     lead_tasks_calendar_id = lead_tasks_calendar.get("CalendarId")
 
-    tasks_result = get_today_tasks(today)
+    tasks_result = get_due_tasks(start_date, end_date)
 
     if not tasks_result["ok"]:
         return jsonify({
@@ -311,10 +316,17 @@ def crm_test():
 
     deploy_eligible_tasks.sort(key=lambda item: (
         item.get("priority_order", 99),
+        item.get("due_date") or "",
         item.get("contact_name") or ""
     ))
 
     manual_rels_pc_tasks.sort(key=lambda item: (
+        item.get("due_date") or "",
+        item.get("contact_name") or ""
+    ))
+
+    ignored_tasks.sort(key=lambda item: (
+        item.get("due_date") or "",
         item.get("contact_name") or ""
     ))
 
@@ -323,16 +335,19 @@ def crm_test():
         "mode": "read-only",
 
         "source": "workspace_lead_tasks_due",
-        "date_filter": "today_only",
-        "date_checked": today.isoformat(),
+        "date_filter": "overdue_plus_today",
+        "date_range_checked": {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat()
+        },
         "calendar_filter": "LEAD TASKS",
         "classification_source": "exact_task_name_only",
 
         "lead_tasks_calendar_found": True,
         "lead_tasks_calendar_name": lead_tasks_calendar.get("Name"),
 
-        "total_incomplete_tasks_checked_today": len(tasks),
-        "lead_task_section_tasks_found_today": len(lead_section_tasks),
+        "total_incomplete_tasks_checked": len(tasks),
+        "lead_task_section_tasks_found": len(lead_section_tasks),
 
         "vapi_new_tasks_found": vapi_new_count,
         "vapi_regular_tasks_found": vapi_regular_count,
@@ -349,16 +364,16 @@ def crm_test():
         ],
 
         "rules": [
-            "Only today's tasks.",
-            "Only Your Workspace LEAD TASKS calendar.",
+            "Reads Your Workspace LEAD TASKS due list.",
+            "Date range is overdue plus today.",
             "Only exact task name commands deploy.",
             "Task notes/descriptions do not trigger Vapi deployment.",
             "Plain RELS PC is manual SMS/broadcast only and blacklisted from Vapi.",
             "AUDIT DEPLOY VAPI, VAPI REVIEW, and other non-exact names are ignored."
         ],
 
-        "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:50],
-        "manual_rels_pc_blacklist_preview": manual_rels_pc_tasks[:15],
+        "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:75],
+        "manual_rels_pc_blacklist_preview": manual_rels_pc_tasks[:25],
         "ignored_tasks_preview": ignored_tasks[:25],
 
         "safe": "No campaigns were created. No secret values are displayed."
