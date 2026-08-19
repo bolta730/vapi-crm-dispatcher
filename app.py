@@ -259,66 +259,62 @@ def mask_phone(phone):
     return "***"
 
 
-def normalize_address_values(value):
-    addresses = []
-
+def normalize_job_title_value(value):
     if not value:
-        return addresses
+        return None
 
     if isinstance(value, str):
-        if value.strip():
-            addresses.append(value.strip())
+        clean = value.strip()
+        return clean if clean else None
 
-    elif isinstance(value, dict):
-        parts = [
-            value.get("Street"),
-            value.get("City"),
-            value.get("State"),
-            value.get("Zip"),
-            value.get("Country")
-        ]
+    if isinstance(value, dict):
+        text = (
+            value.get("Text")
+            or value.get("Value")
+            or value.get("Title")
+            or value.get("JobTitle")
+            or value.get("Job Title")
+        )
+        if text and str(text).strip():
+            return str(text).strip()
 
-        joined = ", ".join([str(part).strip() for part in parts if part])
-        if joined:
-            addresses.append(joined)
-
-        text = value.get("Text") or value.get("Address") or value.get("Value")
-        if text:
-            addresses.append(str(text).strip())
-
-    elif isinstance(value, list):
+    if isinstance(value, list):
         for item in value:
-            addresses.extend(normalize_address_values(item))
+            found = normalize_job_title_value(item)
+            if found:
+                return found
 
-    return addresses
+    return None
 
 
-def extract_addresses_from_contact(contact):
-    raw_values = []
+def extract_property_address_from_job_title_only(contact):
+    """
+    David's CRM rule:
+    Job Title is the ONLY property address field.
+    No Address / Property / Street fallback.
+    """
+    possible_job_title_keys = [
+        "JobTitle",
+        "Job Title",
+        "Title",
+        "Job title",
+        "job_title",
+        "jobTitle"
+    ]
+
+    for key in possible_job_title_keys:
+        if key in contact:
+            found = normalize_job_title_value(contact.get(key))
+            if found:
+                return found
 
     for key, value in contact.items():
-        key_upper = normalize_text(key)
+        if compact_text(key) == "JOBTITLE":
+            found = normalize_job_title_value(value)
+            if found:
+                return found
 
-        if (
-            "ADDRESS" in key_upper
-            or "PROPERTY" in key_upper
-            or "STREET" in key_upper
-        ):
-            raw_values.append(value)
-
-    addresses = []
-    for raw_value in raw_values:
-        addresses.extend(normalize_address_values(raw_value))
-
-    seen = set()
-    unique = []
-    for address in addresses:
-        clean = str(address).strip()
-        if clean and clean not in seen:
-            unique.append(clean)
-            seen.add(clean)
-
-    return unique
+    return None
 
 
 def mask_address(address):
@@ -327,12 +323,12 @@ def mask_address(address):
     if not text:
         return None
 
-    parts = text.split(",")
+    parts = text.replace("\n", ", ").split(",")
 
     if len(parts) >= 2:
-        return "ADDRESS_FOUND: " + ", ".join(parts[1:]).strip()
+        return "JOB_TITLE_ADDRESS_FOUND: " + ", ".join(parts[1:]).strip()
 
-    return "ADDRESS_FOUND"
+    return "JOB_TITLE_ADDRESS_FOUND"
 
 
 def get_contacts_by_ids(contact_ids):
@@ -618,7 +614,7 @@ def contact_dry_run():
         contact = contacts_by_id.get(contact_id, {})
 
         phones = extract_phones_from_contact(contact)
-        addresses = extract_addresses_from_contact(contact)
+        property_address = extract_property_address_from_job_title_only(contact)
 
         warnings = []
 
@@ -626,8 +622,8 @@ def contact_dry_run():
             warnings.append("MISSING_PHONE")
             missing_phone_count += 1
 
-        if not addresses:
-            warnings.append("MISSING_ADDRESS")
+        if not property_address:
+            warnings.append("MISSING_JOB_TITLE_ADDRESS")
             missing_address_count += 1
 
         if task.get("suggested_agent") == "NEEDS_REVIEW":
@@ -644,8 +640,9 @@ def contact_dry_run():
             "phones_found_count": len(phones),
             "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
 
-            "address_found": bool(addresses),
-            "address_preview": mask_address(addresses[0]) if addresses else None,
+            "address_source": "Job Title only",
+            "address_found": bool(property_address),
+            "address_preview": mask_address(property_address) if property_address else None,
 
             "warnings": warnings,
             "task_id": task.get("task_id"),
@@ -661,17 +658,19 @@ def contact_dry_run():
         "calendar_filter": "LEAD TASKS",
         "classification_source": "exact_task_name_only",
 
+        "address_rule": "Job Title is the only property address field.",
         "deploy_eligible_vapi_tasks_found": len(deploy_tasks),
         "contacts_requested": len(contact_ids),
         "contacts_returned": len(contacts),
 
         "missing_phone_count": missing_phone_count,
-        "missing_address_count": missing_address_count,
+        "missing_job_title_address_count": missing_address_count,
         "needs_agent_review_count": needs_agent_review_count,
 
         "rules": [
             "Plain RELS PC remains blacklisted from Vapi.",
             "Only exact VAPI and VAPI NEW task names are included.",
+            "Property address is pulled from Job Title only.",
             "Full phone numbers are not displayed on this public page.",
             "Suggested agent is a dry-run guess only.",
             "No campaigns were created and no Vapi calls were made."
