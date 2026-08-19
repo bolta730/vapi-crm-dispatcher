@@ -828,3 +828,122 @@ def morning_report():
 
         "safe": "Morning report only. No campaigns were created. No Vapi calls were made."
     })
+
+
+@app.route("/deploy-plan")
+def deploy_plan():
+    report = build_contact_rows()
+
+    if not report["ok"]:
+        return jsonify({
+            "crm_connection": "failed",
+            "mode": "deploy-plan",
+            "step_failed": report["step_failed"],
+            "error": report["error"]
+        }), 500
+
+    buckets = report["buckets"]
+
+    return jsonify({
+        "crm_connection": "ok",
+        "mode": "deploy-plan",
+        "plan_type": "dry-run-only",
+
+        "source": "Your Workspace → Tasks that are due → LEAD TASKS",
+        "date_filter": "overdue_plus_today",
+        "date_range_checked": {
+            "start": buckets["start_date"],
+            "end": buckets["end_date"]
+        },
+
+        "deployment_status": "WAITING_FOR_DAVID_COMMAND",
+        "start_time_status": "NOT_SET",
+        "start_time": None,
+
+        "control_rule": "This is only a deployment-plan preview. David must give start time, final routing, skips, and final approval before campaigns are created.",
+        "routing_rule": "Suggested route only. Final route requires David command.",
+
+        "campaign_spacing_rule": {
+            "campaign_window_minutes": 5,
+            "gap_between_campaigns_minutes": 5,
+            "example_if_david_says_start_at_9am": [
+                "9:00-9:05 first approved campaign batch",
+                "9:10-9:15 second approved campaign batch"
+            ]
+        },
+
+        "summary": {
+            "vapi_tasks_due": len(buckets["deploy_eligible_tasks"]),
+            "callable_leads": report["callable_count"],
+            "skip_until_fixed": report["skip_count"],
+            "suggested_josh_estate_batch_count": len(report["suggested_josh_estate_rows"]),
+            "suggested_michael_owner_batch_count": len(report["suggested_michael_owner_rows"]),
+            "mark_batch_count": 0,
+            "margaret_batch_count": 0,
+            "campaigns_ready_to_create": 0,
+            "campaigns_created": 0,
+            "vapi_calls_made": 0
+        },
+
+        "planned_batches_waiting_for_david_command": [
+            {
+                "batch_label": "Josh Estate",
+                "suggested_agent": "Josh",
+                "status": "WAITING_FOR_DAVID_COMMAND",
+                "lead_count": len(report["suggested_josh_estate_rows"]),
+                "meaning": "These are estate/probate-looking callable leads. They only go to Josh if David commands Josh Estate.",
+                "preview": report["suggested_josh_estate_rows"][:50]
+            },
+            {
+                "batch_label": "Michael Owner",
+                "suggested_agent": "Michael",
+                "status": "WAITING_FOR_DAVID_COMMAND",
+                "lead_count": len(report["suggested_michael_owner_rows"]),
+                "meaning": "These are regular owner/property-looking callable leads. They only go to Michael if David commands Michael Owner.",
+                "preview": report["suggested_michael_owner_rows"][:50]
+            },
+            {
+                "batch_label": "Mark",
+                "suggested_agent": "Mark",
+                "status": "DAVID_COMMAND_ONLY",
+                "lead_count": 0,
+                "meaning": "Mark is only used when David names specific leads for Mark.",
+                "preview": []
+            },
+            {
+                "batch_label": "Margaret",
+                "suggested_agent": "Margaret",
+                "status": "DAVID_COMMAND_ONLY",
+                "lead_count": 0,
+                "meaning": "Margaret is only used when David names specific leads for Margaret.",
+                "preview": []
+            }
+        ],
+
+        "skipped_until_fixed": {
+            "count": report["skip_count"],
+            "meaning": "These will not be deployed unless missing phone/address is fixed.",
+            "preview": report["skip_rows"][:25]
+        },
+
+        "next_command_needed_from_david": {
+            "plain_english_example": "Start at 9 AM. Josh Estate yes. Michael Owner yes. No Mark. No Margaret. Skip broken leads.",
+            "available_route_commands": [
+                "Josh Estate",
+                "Michael Owner",
+                "Mark",
+                "Margaret",
+                "Skip"
+            ],
+            "required_before_real_campaign_creation": [
+                "Start time",
+                "Which suggested batches to approve",
+                "Any named leads to Mark",
+                "Any named leads to Margaret",
+                "Any extra skips",
+                "Final approval"
+            ]
+        },
+
+        "safe": "Dry run only. No campaigns were created. No Vapi calls were made."
+    })
