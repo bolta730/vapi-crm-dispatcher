@@ -173,7 +173,7 @@ def classify_task_exact_name_only(task_name):
     }
 
 
-def default_agent_suggestion(contact_name):
+def suggested_route_from_contact_name(contact_name):
     text = normalize_text(contact_name)
 
     estate_words = [
@@ -190,15 +190,17 @@ def default_agent_suggestion(contact_name):
     for word in estate_words:
         if word in text:
             return {
-                "default_agent": "Josh",
-                "routing_group": "DEFAULT_JOSH",
-                "reason": "Estate/probate-looking lead. David can override."
+                "suggested_route": "Josh Estate",
+                "suggested_agent": "Josh",
+                "suggested_route_group": "SUGGESTED_JOSH_ESTATE",
+                "route_reason": "Estate/probate-looking lead. Final route requires David command."
             }
 
     return {
-        "default_agent": "Michael",
-        "routing_group": "DEFAULT_MICHAEL",
-        "reason": "Regular owner/property-looking lead. David can override."
+        "suggested_route": "Michael Owner",
+        "suggested_agent": "Michael",
+        "suggested_route_group": "SUGGESTED_MICHAEL_OWNER",
+        "route_reason": "Regular owner/property-looking lead. Final route requires David command."
     }
 
 
@@ -416,7 +418,7 @@ def build_task_buckets():
         classification = classify_task_exact_name_only(task_name)
 
         contact_name = task.get("ContactMetaData", {}).get("Name") or ""
-        agent_default = default_agent_suggestion(contact_name)
+        route_suggestion = suggested_route_from_contact_name(contact_name)
 
         task_preview = {
             "priority_order": classification["priority_order"],
@@ -429,9 +431,12 @@ def build_task_buckets():
             "contact_id": task.get("ContactId"),
             "contact_id_present": bool(task.get("ContactId")),
             "contact_name": contact_name,
-            "default_agent": agent_default["default_agent"],
-            "routing_group": agent_default["routing_group"],
-            "routing_reason": agent_default["reason"]
+
+            "suggested_route": route_suggestion["suggested_route"],
+            "suggested_agent": route_suggestion["suggested_agent"],
+            "suggested_route_group": route_suggestion["suggested_route_group"],
+            "route_reason": route_suggestion["route_reason"],
+            "final_route_requires_david_command": True
         }
 
         if classification["bucket"] == "deploy":
@@ -516,8 +521,8 @@ def build_contact_rows():
 
     missing_phone_count = 0
     missing_address_count = 0
-    default_josh_count = 0
-    default_michael_count = 0
+    suggested_josh_estate_count = 0
+    suggested_michael_owner_count = 0
     callable_count = 0
     skip_count = 0
 
@@ -541,11 +546,11 @@ def build_contact_rows():
             missing_address_count += 1
             status = "SKIP_UNTIL_FIXED"
 
-        if task.get("routing_group") == "DEFAULT_JOSH":
-            default_josh_count += 1
+        if task.get("suggested_route_group") == "SUGGESTED_JOSH_ESTATE":
+            suggested_josh_estate_count += 1
 
-        if task.get("routing_group") == "DEFAULT_MICHAEL":
-            default_michael_count += 1
+        if task.get("suggested_route_group") == "SUGGESTED_MICHAEL_OWNER":
+            suggested_michael_owner_count += 1
 
         if status == "CALLABLE":
             callable_count += 1
@@ -559,10 +564,12 @@ def build_contact_rows():
             "due_date": task.get("due_date"),
             "contact_name": task.get("contact_name"),
 
-            "default_agent": task.get("default_agent"),
-            "routing_group": task.get("routing_group"),
-            "routing_reason": task.get("routing_reason"),
-            "override_note": "David can override to Mark or Margaret by command.",
+            "suggested_route": task.get("suggested_route"),
+            "suggested_agent": task.get("suggested_agent"),
+            "suggested_route_group": task.get("suggested_route_group"),
+            "route_reason": task.get("route_reason"),
+            "final_route_requires_david_command": True,
+            "override_note": "David can command Josh Estate, Michael Owner, Mark, Margaret, or Skip.",
 
             "phones_found_count": len(phones),
             "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
@@ -578,8 +585,16 @@ def build_contact_rows():
 
     callable_rows = [row for row in rows if row["status"] == "CALLABLE"]
     skip_rows = [row for row in rows if row["status"] != "CALLABLE"]
-    josh_rows = [row for row in callable_rows if row["routing_group"] == "DEFAULT_JOSH"]
-    michael_rows = [row for row in callable_rows if row["routing_group"] == "DEFAULT_MICHAEL"]
+
+    suggested_josh_estate_rows = [
+        row for row in callable_rows
+        if row["suggested_route_group"] == "SUGGESTED_JOSH_ESTATE"
+    ]
+
+    suggested_michael_owner_rows = [
+        row for row in callable_rows
+        if row["suggested_route_group"] == "SUGGESTED_MICHAEL_OWNER"
+    ]
 
     return {
         "ok": True,
@@ -589,12 +604,12 @@ def build_contact_rows():
         "rows": rows,
         "callable_rows": callable_rows,
         "skip_rows": skip_rows,
-        "josh_rows": josh_rows,
-        "michael_rows": michael_rows,
+        "suggested_josh_estate_rows": suggested_josh_estate_rows,
+        "suggested_michael_owner_rows": suggested_michael_owner_rows,
         "missing_phone_count": missing_phone_count,
         "missing_address_count": missing_address_count,
-        "default_josh_count": default_josh_count,
-        "default_michael_count": default_michael_count,
+        "suggested_josh_estate_count": suggested_josh_estate_count,
+        "suggested_michael_owner_count": suggested_michael_owner_count,
         "callable_count": callable_count,
         "skip_count": skip_count
     }
@@ -679,7 +694,8 @@ def crm_test():
             "Only exact task name commands deploy.",
             "Task notes/descriptions do not trigger Vapi deployment.",
             "Plain RELS PC is manual SMS/broadcast only and blacklisted from Vapi.",
-            "AUDIT DEPLOY VAPI, VAPI REVIEW, and other non-exact names are ignored."
+            "AUDIT DEPLOY VAPI, VAPI REVIEW, and other non-exact names are ignored.",
+            "Route labels are suggestions only until David commands final routing."
         ],
 
         "deploy_eligible_vapi_tasks_preview": buckets["deploy_eligible_tasks"][:75],
@@ -712,14 +728,16 @@ def contact_dry_run():
         "classification_source": "exact_task_name_only",
 
         "address_rule": "Job Title is the only property address field.",
+        "routing_rule": "Suggested route only. Final route requires David command.",
+
         "deploy_eligible_vapi_tasks_found": len(report["buckets"]["deploy_eligible_tasks"]),
         "contacts_requested": report["contacts_requested"],
         "contacts_returned": report["contacts_returned"],
 
         "missing_phone_count": report["missing_phone_count"],
         "missing_job_title_address_count": report["missing_address_count"],
-        "default_josh_count": report["default_josh_count"],
-        "default_michael_count": report["default_michael_count"],
+        "suggested_josh_estate_count": report["suggested_josh_estate_count"],
+        "suggested_michael_owner_count": report["suggested_michael_owner_count"],
         "callable_count": report["callable_count"],
         "skip_count": report["skip_count"],
 
@@ -727,7 +745,7 @@ def contact_dry_run():
             "Plain RELS PC remains blacklisted from Vapi.",
             "Only exact VAPI and VAPI NEW task names are included.",
             "Property address is pulled from Job Title only.",
-            "Michael and Josh are default suggestions only.",
+            "Josh Estate and Michael Owner are suggestions only.",
             "Mark and Margaret are only used when David commands it.",
             "No campaigns were created and no Vapi calls were made."
         ],
@@ -763,7 +781,8 @@ def morning_report():
             "end": buckets["end_date"]
         },
 
-        "control_rule": "Report only. David gives the deployment time, skips, and agent overrides before campaigns are created.",
+        "control_rule": "Report only. David gives the deployment time, skips, and final routing before campaigns are created.",
+        "routing_rule": "Suggested route only. Final route requires David command.",
 
         "summary": {
             "vapi_tasks_due": len(buckets["deploy_eligible_tasks"]),
@@ -771,32 +790,41 @@ def morning_report():
             "skip_until_fixed": report["skip_count"],
             "missing_phone_count": report["missing_phone_count"],
             "missing_job_title_address_count": report["missing_address_count"],
-            "default_josh_estate_leads": len(report["josh_rows"]),
-            "default_michael_regular_leads": len(report["michael_rows"]),
+            "suggested_josh_estate_leads": len(report["suggested_josh_estate_rows"]),
+            "suggested_michael_owner_leads": len(report["suggested_michael_owner_rows"]),
             "vapi_new_priority_tasks": buckets["vapi_new_count"],
             "regular_vapi_tasks": buckets["vapi_regular_count"]
         },
 
-        "default_routing_rules": [
-            "Estate/probate-looking leads default to Josh.",
-            "Regular owner/property-looking leads default to Michael.",
+        "route_command_labels": [
+            "Josh Estate",
+            "Michael Owner",
+            "Mark",
+            "Margaret",
+            "Skip"
+        ],
+
+        "suggested_routing_rules": [
+            "Estate/probate-looking leads are suggested as Josh Estate.",
+            "Regular owner/property-looking leads are suggested as Michael Owner.",
             "Mark is only used when David commands it.",
             "Margaret is only used when David commands it.",
-            "Missing phone or missing Job Title address is skipped until fixed."
+            "Missing phone or missing Job Title address is skipped until fixed.",
+            "These are suggestions only, not final routing."
         ],
 
         "next_instruction_needed_from_david": [
             "What time should the campaigns start?",
-            "Should Josh handle all estate/default-Josh leads?",
-            "Should Michael handle all regular/default-Michael leads?",
+            "Should Josh Estate handle the suggested estate leads?",
+            "Should Michael Owner handle the suggested regular owner leads?",
             "Any specific lead overrides to Mark?",
             "Any specific lead overrides to Margaret?",
-            "Any leads to skip even if callable?"
+            "Any leads to Skip even if callable?"
         ],
 
         "skip_until_fixed_preview": report["skip_rows"][:25],
-        "default_josh_preview": report["josh_rows"][:50],
-        "default_michael_preview": report["michael_rows"][:50],
+        "suggested_josh_estate_preview": report["suggested_josh_estate_rows"][:50],
+        "suggested_michael_owner_preview": report["suggested_michael_owner_rows"][:50],
 
         "safe": "Morning report only. No campaigns were created. No Vapi calls were made."
     })
