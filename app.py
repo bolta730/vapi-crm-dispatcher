@@ -69,6 +69,10 @@ def normalize_text(value):
     return str(value or "").strip().upper()
 
 
+def compact_text(value):
+    return normalize_text(value).replace(" ", "")
+
+
 def get_today_tasks(today):
     all_tasks = []
     page = 1
@@ -107,39 +111,66 @@ def get_today_tasks(today):
     }
 
 
-def classify_task_by_name_only(task_name):
-    name_text = normalize_text(task_name)
-    compact_name = name_text.replace(" ", "")
+def classify_task_exact_name_only(task_name):
+    """
+    SAFETY RULE:
+    Only the exact task NAME/TITLE controls Vapi deployment.
 
-    has_vapi_new = (
-        "VAPI NEW" in name_text
-        or "VAPINEW" in compact_name
-    )
+    These exact commands deploy:
+    - VAPI
+    - VAPI NEW
+    - VAPI RELS PC
+    - VAPI NEW RELS PC
 
-    has_vapi = "VAPI" in name_text or "VAPI" in compact_name
+    Plain RELS PC stays manual.
+    Notes/descriptions are ignored.
+    Anything else is ignored.
+    """
+    name = normalize_text(task_name)
+    compact = compact_text(task_name)
 
-    has_rels_pc = (
-        "RELS PC" in name_text
-        or "RELSPC" in compact_name
-    )
+    exact_vapi_new_commands = {
+        "VAPI NEW",
+        "VAPI NEW RELS PC",
+    }
 
-    if has_vapi_new:
+    exact_vapi_new_compact_commands = {
+        "VAPINEW",
+        "VAPINEWRELSPC",
+    }
+
+    exact_vapi_commands = {
+        "VAPI",
+        "VAPI RELS PC",
+    }
+
+    exact_vapi_compact_commands = {
+        "VAPI",
+        "VAPIRELSPC",
+    }
+
+    rels_pc_manual_commands = {
+        "RELS PC",
+        "RELSPC",
+    }
+
+    if name in exact_vapi_new_commands or compact in exact_vapi_new_compact_commands:
         return {
             "bucket": "deploy",
             "priority_order": 1,
             "priority_label": "VAPI NEW",
-            "reason": "Highest priority Vapi deployment task. Task name contains VAPI NEW."
+            "reason": "Exact task name is VAPI NEW or VAPI NEW RELS PC."
         }
 
-    if has_vapi:
+    if name in exact_vapi_commands or compact in exact_vapi_compact_commands:
         return {
             "bucket": "deploy",
             "priority_order": 2,
             "priority_label": "VAPI",
-            "reason": "Regular Vapi deployment task. Task name contains VAPI."
+            "reason": "Exact task name is VAPI or VAPI RELS PC."
         }
 
-    if has_rels_pc:
+    if name in rels_pc_manual_commands or compact in rels_pc_manual_commands:
         return {
             "bucket": "manual_sms_only",
             "priority_order": 50,
@@ -151,7 +182,7 @@ def classify_task_by_name_only(task_name):
         "bucket": "ignore",
         "priority_order": 99,
         "priority_label": "IGNORE",
-        "reason": "Task name does not contain VAPI, VAPI NEW, or RELS PC."
+        "reason": "Task name is not an exact Vapi deployment command."
     }
 
 
@@ -214,6 +245,7 @@ def crm_test():
         return jsonify({
             "crm_connection": "ok",
             "mode": "read-only",
+            "source": "workspace_lead_tasks_due",
             "lead_tasks_calendar_found": False,
             "calendar_names_found": calendar_names_found,
             "safe": "No campaigns were created. No secret values are displayed."
@@ -248,7 +280,7 @@ def crm_test():
         lead_section_tasks.append(task)
 
         task_name = task.get("Name", "")
-        classification = classify_task_by_name_only(task_name)
+        classification = classify_task_exact_name_only(task_name)
 
         task_preview = {
             "priority_order": classification["priority_order"],
@@ -282,12 +314,19 @@ def crm_test():
         item.get("contact_name") or ""
     ))
 
+    manual_rels_pc_tasks.sort(key=lambda item: (
+        item.get("contact_name") or ""
+    ))
+
     return jsonify({
         "crm_connection": "ok",
         "mode": "read-only",
-        "classification_source": "task_name_only",
+
+        "source": "workspace_lead_tasks_due",
         "date_filter": "today_only",
         "date_checked": today.isoformat(),
+        "calendar_filter": "LEAD TASKS",
+        "classification_source": "exact_task_name_only",
 
         "lead_tasks_calendar_found": True,
         "lead_tasks_calendar_name": lead_tasks_calendar.get("Name"),
@@ -300,20 +339,27 @@ def crm_test():
         "deploy_eligible_vapi_tasks_found": len(deploy_eligible_tasks),
 
         "manual_rels_pc_tasks_blacklisted_from_vapi": len(manual_rels_pc_tasks),
+        "ignored_tasks_found": len(ignored_tasks),
+
+        "allowed_deploy_task_names": [
+            "VAPI",
+            "VAPI NEW",
+            "VAPI RELS PC",
+            "VAPI NEW RELS PC"
+        ],
 
         "rules": [
-            "Today only.",
-            "Only LEAD TASKS calendar.",
-            "Only task name/title controls Vapi deployment.",
+            "Only today's tasks.",
+            "Only Your Workspace LEAD TASKS calendar.",
+            "Only exact task name commands deploy.",
             "Task notes/descriptions do not trigger Vapi deployment.",
-            "VAPI NEW = deploy first.",
-            "VAPI = regular deploy.",
-            "Plain RELS PC = manual SMS/broadcast only and blacklisted from Vapi."
+            "Plain RELS PC is manual SMS/broadcast only and blacklisted from Vapi.",
+            "AUDIT DEPLOY VAPI, VAPI REVIEW, and other non-exact names are ignored."
         ],
 
         "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:50],
         "manual_rels_pc_blacklist_preview": manual_rels_pc_tasks[:15],
-        "ignored_tasks_preview": ignored_tasks[:15],
+        "ignored_tasks_preview": ignored_tasks[:25],
 
         "safe": "No campaigns were created. No secret values are displayed."
     })
