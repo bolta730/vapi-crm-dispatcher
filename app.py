@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import date, timedelta
 
 import requests
@@ -112,20 +113,6 @@ def get_due_tasks(start_date, end_date):
 
 
 def classify_task_exact_name_only(task_name):
-    """
-    SAFETY RULE:
-    Only the exact task NAME/TITLE controls Vapi deployment.
-
-    These exact commands deploy:
-    - VAPI
-    - VAPI NEW
-    - VAPI RELS PC
-    - VAPI NEW RELS PC
-
-    Plain RELS PC stays manual.
-    Notes/descriptions are ignored.
-    Anything else is ignored.
-    """
     name = normalize_text(task_name)
     compact = compact_text(task_name)
 
@@ -186,52 +173,195 @@ def classify_task_exact_name_only(task_name):
     }
 
 
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "ok",
-        "service": "vapi-crm-dispatcher",
-        "mode": "dry-run"
+def suggested_agent_from_task(task_name, contact_name):
+    text = normalize_text(task_name + " " + contact_name)
+
+    if "MARK" in text or "IPA" in text:
+        return "Mark"
+
+    if "MARGARET" in text or "INHERITANCE" in text:
+        return "Margaret"
+
+    if "JOSH" in text or "PROBATE" in text or "ESTATE" in text:
+        return "Josh"
+
+    if "MICHAEL" in text or "OWNER" in text:
+        return "Michael"
+
+    if "ESTATE" in text:
+        return "Josh"
+
+    return "NEEDS_REVIEW"
+
+
+def normalize_phone_values(value):
+    phones = []
+
+    if not value:
+        return phones
+
+    if isinstance(value, str):
+        phones.append(value)
+
+    elif isinstance(value, dict):
+        text = (
+            value.get("Text")
+            or value.get("Phone")
+            or value.get("Value")
+            or value.get("Number")
+        )
+        if text:
+            phones.append(text)
+
+    elif isinstance(value, list):
+        for item in value:
+            phones.extend(normalize_phone_values(item))
+
+    return phones
+
+
+def extract_phones_from_contact(contact):
+    raw_values = []
+
+    for key, value in contact.items():
+        key_upper = normalize_text(key)
+
+        if "PHONE" in key_upper or "MOBILE" in key_upper or "CELL" in key_upper:
+            raw_values.append(value)
+
+    phones = []
+    for raw_value in raw_values:
+        phones.extend(normalize_phone_values(raw_value))
+
+    cleaned = []
+    for phone in phones:
+        digits = re.sub(r"\D", "", str(phone))
+
+        if len(digits) == 10:
+            cleaned.append("+1" + digits)
+        elif len(digits) == 11 and digits.startswith("1"):
+            cleaned.append("+" + digits)
+
+    seen = set()
+    unique = []
+    for phone in cleaned:
+        if phone not in seen:
+            unique.append(phone)
+            seen.add(phone)
+
+    return unique
+
+
+def mask_phone(phone):
+    digits = re.sub(r"\D", "", str(phone))
+    if len(digits) >= 4:
+        return "***" + digits[-4:]
+    return "***"
+
+
+def normalize_address_values(value):
+    addresses = []
+
+    if not value:
+        return addresses
+
+    if isinstance(value, str):
+        if value.strip():
+            addresses.append(value.strip())
+
+    elif isinstance(value, dict):
+        parts = [
+            value.get("Street"),
+            value.get("City"),
+            value.get("State"),
+            value.get("Zip"),
+            value.get("Country")
+        ]
+
+        joined = ", ".join([str(part).strip() for part in parts if part])
+        if joined:
+            addresses.append(joined)
+
+        text = value.get("Text") or value.get("Address") or value.get("Value")
+        if text:
+            addresses.append(str(text).strip())
+
+    elif isinstance(value, list):
+        for item in value:
+            addresses.extend(normalize_address_values(item))
+
+    return addresses
+
+
+def extract_addresses_from_contact(contact):
+    raw_values = []
+
+    for key, value in contact.items():
+        key_upper = normalize_text(key)
+
+        if (
+            "ADDRESS" in key_upper
+            or "PROPERTY" in key_upper
+            or "STREET" in key_upper
+        ):
+            raw_values.append(value)
+
+    addresses = []
+    for raw_value in raw_values:
+        addresses.extend(normalize_address_values(raw_value))
+
+    seen = set()
+    unique = []
+    for address in addresses:
+        clean = str(address).strip()
+        if clean and clean not in seen:
+            unique.append(clean)
+            seen.add(clean)
+
+    return unique
+
+
+def mask_address(address):
+    text = str(address or "").strip()
+
+    if not text:
+        return None
+
+    parts = text.split(",")
+
+    if len(parts) >= 2:
+        return "ADDRESS_FOUND: " + ", ".join(parts[1:]).strip()
+
+    return "ADDRESS_FOUND"
+
+
+def get_contacts_by_ids(contact_ids):
+    if not contact_ids:
+        return {
+            "ok": True,
+            "data": []
+        }
+
+    return call_lacrm("GetContactsById", {
+        "ContactIds": contact_ids,
+        "MaxNumberOfResults": 10000
     })
 
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "healthy": True
-    })
-
-
-@app.route("/config-check")
-def config_check():
-    lacrm_key = os.getenv("LACRM_API_KEY")
-    vapi_key = os.getenv("VAPI_API_KEY")
-
-    return jsonify({
-        "lacrm_api_key_loaded": bool(lacrm_key),
-        "vapi_api_key_loaded": bool(vapi_key),
-        "safe": "No secret values are displayed."
-    })
-
-
-@app.route("/crm-test")
-def crm_test():
+def build_task_buckets():
     today = date.today()
 
-    # Your Workspace → Tasks that are due → LEAD TASKS
-    # means overdue tasks plus today's tasks.
     start_date = today - timedelta(days=90)
     end_date = today
 
     calendars_result = call_lacrm("GetCalendars")
 
     if not calendars_result["ok"]:
-        return jsonify({
-            "crm_connection": "failed",
-            "mode": "read-only",
+        return {
+            "ok": False,
             "step_failed": "GetCalendars",
             "error": calendars_result["error"]
-        }), 500
+        }
 
     calendars = extract_results(calendars_result["data"])
 
@@ -247,26 +377,25 @@ def crm_test():
             break
 
     if not lead_tasks_calendar:
-        return jsonify({
-            "crm_connection": "ok",
-            "mode": "read-only",
-            "source": "workspace_lead_tasks_due",
-            "lead_tasks_calendar_found": False,
-            "calendar_names_found": calendar_names_found,
-            "safe": "No campaigns were created. No secret values are displayed."
-        })
+        return {
+            "ok": False,
+            "step_failed": "Find LEAD TASKS calendar",
+            "error": {
+                "lead_tasks_calendar_found": False,
+                "calendar_names_found": calendar_names_found
+            }
+        }
 
     lead_tasks_calendar_id = lead_tasks_calendar.get("CalendarId")
 
     tasks_result = get_due_tasks(start_date, end_date)
 
     if not tasks_result["ok"]:
-        return jsonify({
-            "crm_connection": "failed",
-            "mode": "read-only",
+        return {
+            "ok": False,
             "step_failed": "GetTasks",
             "error": tasks_result["error"]
-        }), 500
+        }
 
     tasks = tasks_result["data"]
 
@@ -287,6 +416,8 @@ def crm_test():
         task_name = task.get("Name", "")
         classification = classify_task_exact_name_only(task_name)
 
+        contact_name = task.get("ContactMetaData", {}).get("Name") or ""
+
         task_preview = {
             "priority_order": classification["priority_order"],
             "priority_label": classification["priority_label"],
@@ -295,8 +426,10 @@ def crm_test():
             "task_id": task.get("TaskId"),
             "task_name": task_name,
             "due_date": task.get("DueDate"),
+            "contact_id": task.get("ContactId"),
             "contact_id_present": bool(task.get("ContactId")),
-            "contact_name": task.get("ContactMetaData", {}).get("Name")
+            "contact_name": contact_name,
+            "suggested_agent": suggested_agent_from_task(task_name, contact_name)
         }
 
         if classification["bucket"] == "deploy":
@@ -330,6 +463,62 @@ def crm_test():
         item.get("contact_name") or ""
     ))
 
+    return {
+        "ok": True,
+        "today": today.isoformat(),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "lead_tasks_calendar": lead_tasks_calendar,
+        "tasks": tasks,
+        "lead_section_tasks": lead_section_tasks,
+        "deploy_eligible_tasks": deploy_eligible_tasks,
+        "manual_rels_pc_tasks": manual_rels_pc_tasks,
+        "ignored_tasks": ignored_tasks,
+        "vapi_new_count": vapi_new_count,
+        "vapi_regular_count": vapi_regular_count
+    }
+
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "ok",
+        "service": "vapi-crm-dispatcher",
+        "mode": "dry-run"
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "healthy": True
+    })
+
+
+@app.route("/config-check")
+def config_check():
+    lacrm_key = os.getenv("LACRM_API_KEY")
+    vapi_key = os.getenv("VAPI_API_KEY")
+
+    return jsonify({
+        "lacrm_api_key_loaded": bool(lacrm_key),
+        "vapi_api_key_loaded": bool(vapi_key),
+        "safe": "No secret values are displayed."
+    })
+
+
+@app.route("/crm-test")
+def crm_test():
+    buckets = build_task_buckets()
+
+    if not buckets["ok"]:
+        return jsonify({
+            "crm_connection": "failed",
+            "mode": "read-only",
+            "step_failed": buckets["step_failed"],
+            "error": buckets["error"]
+        }), 500
+
     return jsonify({
         "crm_connection": "ok",
         "mode": "read-only",
@@ -337,24 +526,24 @@ def crm_test():
         "source": "workspace_lead_tasks_due",
         "date_filter": "overdue_plus_today",
         "date_range_checked": {
-            "start": start_date.isoformat(),
-            "end": end_date.isoformat()
+            "start": buckets["start_date"],
+            "end": buckets["end_date"]
         },
         "calendar_filter": "LEAD TASKS",
         "classification_source": "exact_task_name_only",
 
         "lead_tasks_calendar_found": True,
-        "lead_tasks_calendar_name": lead_tasks_calendar.get("Name"),
+        "lead_tasks_calendar_name": buckets["lead_tasks_calendar"].get("Name"),
 
-        "total_incomplete_tasks_checked": len(tasks),
-        "lead_task_section_tasks_found": len(lead_section_tasks),
+        "total_incomplete_tasks_checked": len(buckets["tasks"]),
+        "lead_task_section_tasks_found": len(buckets["lead_section_tasks"]),
 
-        "vapi_new_tasks_found": vapi_new_count,
-        "vapi_regular_tasks_found": vapi_regular_count,
-        "deploy_eligible_vapi_tasks_found": len(deploy_eligible_tasks),
+        "vapi_new_tasks_found": buckets["vapi_new_count"],
+        "vapi_regular_tasks_found": buckets["vapi_regular_count"],
+        "deploy_eligible_vapi_tasks_found": len(buckets["deploy_eligible_tasks"]),
 
-        "manual_rels_pc_tasks_blacklisted_from_vapi": len(manual_rels_pc_tasks),
-        "ignored_tasks_found": len(ignored_tasks),
+        "manual_rels_pc_tasks_blacklisted_from_vapi": len(buckets["manual_rels_pc_tasks"]),
+        "ignored_tasks_found": len(buckets["ignored_tasks"]),
 
         "allowed_deploy_task_names": [
             "VAPI",
@@ -372,9 +561,123 @@ def crm_test():
             "AUDIT DEPLOY VAPI, VAPI REVIEW, and other non-exact names are ignored."
         ],
 
-        "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:75],
-        "manual_rels_pc_blacklist_preview": manual_rels_pc_tasks[:25],
-        "ignored_tasks_preview": ignored_tasks[:25],
+        "deploy_eligible_vapi_tasks_preview": buckets["deploy_eligible_tasks"][:75],
+        "manual_rels_pc_blacklist_preview": buckets["manual_rels_pc_tasks"][:25],
+        "ignored_tasks_preview": buckets["ignored_tasks"][:25],
 
         "safe": "No campaigns were created. No secret values are displayed."
+    })
+
+
+@app.route("/contact-dry-run")
+def contact_dry_run():
+    buckets = build_task_buckets()
+
+    if not buckets["ok"]:
+        return jsonify({
+            "crm_connection": "failed",
+            "mode": "contact-dry-run",
+            "step_failed": buckets["step_failed"],
+            "error": buckets["error"]
+        }), 500
+
+    deploy_tasks = buckets["deploy_eligible_tasks"]
+
+    contact_ids = []
+    for task in deploy_tasks:
+        contact_id = task.get("contact_id")
+        if contact_id and contact_id not in contact_ids:
+            contact_ids.append(contact_id)
+
+    contacts_result = get_contacts_by_ids(contact_ids)
+
+    if not contacts_result["ok"]:
+        return jsonify({
+            "crm_connection": "failed",
+            "mode": "contact-dry-run",
+            "step_failed": "GetContactsById",
+            "error": contacts_result["error"]
+        }), 500
+
+    contacts = extract_results(contacts_result["data"])
+    contacts_by_id = {}
+
+    for contact in contacts:
+        contact_id = contact.get("ContactId")
+        if contact_id:
+            contacts_by_id[contact_id] = contact
+
+    rows = []
+
+    missing_phone_count = 0
+    missing_address_count = 0
+    needs_agent_review_count = 0
+
+    for task in deploy_tasks:
+        contact_id = task.get("contact_id")
+        contact = contacts_by_id.get(contact_id, {})
+
+        phones = extract_phones_from_contact(contact)
+        addresses = extract_addresses_from_contact(contact)
+
+        warnings = []
+
+        if not phones:
+            warnings.append("MISSING_PHONE")
+            missing_phone_count += 1
+
+        if not addresses:
+            warnings.append("MISSING_ADDRESS")
+            missing_address_count += 1
+
+        if task.get("suggested_agent") == "NEEDS_REVIEW":
+            warnings.append("AGENT_NEEDS_REVIEW")
+            needs_agent_review_count += 1
+
+        rows.append({
+            "priority_label": task.get("priority_label"),
+            "task_name": task.get("task_name"),
+            "due_date": task.get("due_date"),
+            "contact_name": task.get("contact_name"),
+            "suggested_agent": task.get("suggested_agent"),
+
+            "phones_found_count": len(phones),
+            "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
+
+            "address_found": bool(addresses),
+            "address_preview": mask_address(addresses[0]) if addresses else None,
+
+            "warnings": warnings,
+            "task_id": task.get("task_id"),
+            "contact_id_present": bool(contact_id)
+        })
+
+    return jsonify({
+        "crm_connection": "ok",
+        "mode": "contact-dry-run",
+
+        "source": "workspace_lead_tasks_due",
+        "date_filter": "overdue_plus_today",
+        "calendar_filter": "LEAD TASKS",
+        "classification_source": "exact_task_name_only",
+
+        "deploy_eligible_vapi_tasks_found": len(deploy_tasks),
+        "contacts_requested": len(contact_ids),
+        "contacts_returned": len(contacts),
+
+        "missing_phone_count": missing_phone_count,
+        "missing_address_count": missing_address_count,
+        "needs_agent_review_count": needs_agent_review_count,
+
+        "rules": [
+            "Plain RELS PC remains blacklisted from Vapi.",
+            "Only exact VAPI and VAPI NEW task names are included.",
+            "Full phone numbers are not displayed on this public page.",
+            "Suggested agent is a dry-run guess only.",
+            "No campaigns were created and no Vapi calls were made."
+        ],
+
+        "deploy_contact_preview": rows[:75],
+
+        "safe": "No campaigns were created. No Vapi calls were made. Full phone numbers are hidden on this public page."
     })
