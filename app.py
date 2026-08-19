@@ -111,43 +111,57 @@ def classify_task(task_name, task_description):
     search_text = normalize_text(task_name + " " + task_description)
     compact_text = search_text.replace(" ", "")
 
-    is_vapi_new = (
+    has_vapi_new = (
         "VAPI NEW" in search_text
         or "VAPINEW" in compact_text
     )
 
-    is_vapi = "VAPI" in search_text
-    is_rels_pc = "RELS PC" in search_text or "RELSPC" in compact_text
+    has_vapi = "VAPI" in search_text or "VAPI" in compact_text
 
-    if is_vapi_new:
+    has_rels_pc = (
+        "RELS PC" in search_text
+        or "RELSPC" in compact_text
+    )
+
+    # Highest priority:
+    # VAPI NEW, vapi new, VAPI NEW RELS PC, vapi new rels pc
+    if has_vapi_new:
         return {
-            "qualified": True,
+            "bucket": "deploy",
+            "qualified_for_vapi": True,
             "priority_order": 1,
             "priority_label": "VAPI NEW",
-            "reason": "Highest priority deployment task"
+            "reason": "Highest priority Vapi deployment task"
         }
 
-    if is_vapi:
+    # Regular Vapi deployment:
+    # VAPI, vapi, VAPI RELS PC, vapi rels pc
+    if has_vapi:
         return {
-            "qualified": True,
+            "bucket": "deploy",
+            "qualified_for_vapi": True,
             "priority_order": 2,
             "priority_label": "VAPI",
             "reason": "Regular Vapi deployment task"
         }
 
-    if is_rels_pc:
+    # Plain RELS PC is manual SMS/broadcast only.
+    # It is NOT eligible for Vapi unless VAPI is also written in the task.
+    if has_rels_pc:
         return {
-            "qualified": True,
-            "priority_order": 3,
-            "priority_label": "RELS PC",
-            "reason": "RELS PC lead task"
+            "bucket": "manual_sms_only",
+            "qualified_for_vapi": False,
+            "priority_order": 50,
+            "priority_label": "RELS PC MANUAL",
+            "reason": "Manual SMS/broadcast only. Ignored by Vapi dispatcher."
         }
 
     return {
-        "qualified": False,
+        "bucket": "ignore",
+        "qualified_for_vapi": False,
         "priority_order": 99,
         "priority_label": "IGNORE",
-        "reason": "Not a Vapi or RELS PC deployment task"
+        "reason": "Not a Vapi deployment task"
     }
 
 
@@ -235,8 +249,11 @@ def crm_test():
     tasks = tasks_result["data"]
 
     lead_section_tasks = []
-    qualifying_tasks = []
+    deploy_eligible_tasks = []
+    manual_rels_pc_tasks = []
+
     vapi_new_count = 0
+    vapi_regular_count = 0
 
     for task in tasks:
         task_calendar_id = task.get("CalendarId")
@@ -251,26 +268,38 @@ def crm_test():
 
         classification = classify_task(task_name, task_description)
 
-        if not classification["qualified"]:
-            continue
-
-        if classification["priority_label"] == "VAPI NEW":
-            vapi_new_count += 1
-
-        qualifying_tasks.append({
+        task_preview = {
             "priority_order": classification["priority_order"],
             "priority_label": classification["priority_label"],
+            "bucket": classification["bucket"],
             "reason": classification["reason"],
             "task_id": task.get("TaskId"),
             "task_name": task_name,
             "due_date": task.get("DueDate"),
             "contact_id_present": bool(task.get("ContactId")),
             "contact_name": task.get("ContactMetaData", {}).get("Name")
-        })
+        }
 
-    # VAPI NEW comes first, then VAPI, then RELS PC.
-    qualifying_tasks.sort(key=lambda item: (
+        if classification["bucket"] == "deploy":
+            if classification["priority_label"] == "VAPI NEW":
+                vapi_new_count += 1
+
+            if classification["priority_label"] == "VAPI":
+                vapi_regular_count += 1
+
+            deploy_eligible_tasks.append(task_preview)
+
+        elif classification["bucket"] == "manual_sms_only":
+            manual_rels_pc_tasks.append(task_preview)
+
+    # VAPI NEW comes first, then regular VAPI.
+    deploy_eligible_tasks.sort(key=lambda item: (
         item.get("priority_order", 99),
+        item.get("due_date") or "",
+        item.get("contact_name") or ""
+    ))
+
+    manual_rels_pc_tasks.sort(key=lambda item: (
         item.get("due_date") or "",
         item.get("contact_name") or ""
     ))
@@ -286,13 +315,21 @@ def crm_test():
         },
         "total_incomplete_tasks_checked": len(tasks),
         "lead_task_section_tasks_found": len(lead_section_tasks),
-        "vapi_new_priority_tasks_found": vapi_new_count,
-        "qualifying_rels_pc_vapi_tasks_found": len(qualifying_tasks),
+
+        "vapi_new_tasks_found": vapi_new_count,
+        "vapi_regular_tasks_found": vapi_regular_count,
+        "deploy_eligible_vapi_tasks_found": len(deploy_eligible_tasks),
+
+        "manual_rels_pc_tasks_ignored_for_vapi": len(manual_rels_pc_tasks),
+
         "deployment_priority_order": [
             "1. VAPI NEW",
             "2. VAPI",
-            "3. RELS PC"
+            "Plain RELS PC is manual only unless VAPI is added to the task name."
         ],
-        "qualifying_tasks_preview": qualifying_tasks[:25],
+
+        "deploy_eligible_vapi_tasks_preview": deploy_eligible_tasks[:25],
+        "manual_rels_pc_tasks_preview": manual_rels_pc_tasks[:10],
+
         "safe": "No campaigns were created. No secret values are displayed."
     })
