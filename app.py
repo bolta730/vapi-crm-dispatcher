@@ -173,25 +173,33 @@ def classify_task_exact_name_only(task_name):
     }
 
 
-def suggested_agent_from_task(task_name, contact_name):
-    text = normalize_text(task_name + " " + contact_name)
+def default_agent_suggestion(contact_name):
+    text = normalize_text(contact_name)
 
-    if "MARK" in text or "IPA" in text:
-        return "Mark"
+    estate_words = [
+        "ESTATE",
+        "PROBATE",
+        "HEIR",
+        "HEIRS",
+        "EXECUTOR",
+        "ADMINISTRATOR",
+        "SURROGATE",
+        "INDEX"
+    ]
 
-    if "MARGARET" in text or "INHERITANCE" in text:
-        return "Margaret"
+    for word in estate_words:
+        if word in text:
+            return {
+                "default_agent": "Josh",
+                "routing_group": "DEFAULT_JOSH",
+                "reason": "Estate/probate-looking lead. David can override."
+            }
 
-    if "JOSH" in text or "PROBATE" in text or "ESTATE" in text:
-        return "Josh"
-
-    if "MICHAEL" in text or "OWNER" in text:
-        return "Michael"
-
-    if "ESTATE" in text:
-        return "Josh"
-
-    return "NEEDS_REVIEW"
+    return {
+        "default_agent": "Michael",
+        "routing_group": "DEFAULT_MICHAEL",
+        "reason": "Regular owner/property-looking lead. David can override."
+    }
 
 
 def normalize_phone_values(value):
@@ -288,11 +296,6 @@ def normalize_job_title_value(value):
 
 
 def extract_property_address_from_job_title_only(contact):
-    """
-    David's CRM rule:
-    Job Title is the ONLY property address field.
-    No Address / Property / Street fallback.
-    """
     possible_job_title_keys = [
         "JobTitle",
         "Job Title",
@@ -413,6 +416,7 @@ def build_task_buckets():
         classification = classify_task_exact_name_only(task_name)
 
         contact_name = task.get("ContactMetaData", {}).get("Name") or ""
+        agent_default = default_agent_suggestion(contact_name)
 
         task_preview = {
             "priority_order": classification["priority_order"],
@@ -425,7 +429,9 @@ def build_task_buckets():
             "contact_id": task.get("ContactId"),
             "contact_id_present": bool(task.get("ContactId")),
             "contact_name": contact_name,
-            "suggested_agent": suggested_agent_from_task(task_name, contact_name)
+            "default_agent": agent_default["default_agent"],
+            "routing_group": agent_default["routing_group"],
+            "routing_reason": agent_default["reason"]
         }
 
         if classification["bucket"] == "deploy":
@@ -472,6 +478,125 @@ def build_task_buckets():
         "ignored_tasks": ignored_tasks,
         "vapi_new_count": vapi_new_count,
         "vapi_regular_count": vapi_regular_count
+    }
+
+
+def build_contact_rows():
+    buckets = build_task_buckets()
+
+    if not buckets["ok"]:
+        return buckets
+
+    deploy_tasks = buckets["deploy_eligible_tasks"]
+
+    contact_ids = []
+    for task in deploy_tasks:
+        contact_id = task.get("contact_id")
+        if contact_id and contact_id not in contact_ids:
+            contact_ids.append(contact_id)
+
+    contacts_result = get_contacts_by_ids(contact_ids)
+
+    if not contacts_result["ok"]:
+        return {
+            "ok": False,
+            "step_failed": "GetContactsById",
+            "error": contacts_result["error"]
+        }
+
+    contacts = extract_results(contacts_result["data"])
+    contacts_by_id = {}
+
+    for contact in contacts:
+        contact_id = contact.get("ContactId")
+        if contact_id:
+            contacts_by_id[contact_id] = contact
+
+    rows = []
+
+    missing_phone_count = 0
+    missing_address_count = 0
+    default_josh_count = 0
+    default_michael_count = 0
+    callable_count = 0
+    skip_count = 0
+
+    for task in deploy_tasks:
+        contact_id = task.get("contact_id")
+        contact = contacts_by_id.get(contact_id, {})
+
+        phones = extract_phones_from_contact(contact)
+        property_address = extract_property_address_from_job_title_only(contact)
+
+        warnings = []
+        status = "CALLABLE"
+
+        if not phones:
+            warnings.append("MISSING_PHONE")
+            missing_phone_count += 1
+            status = "SKIP_UNTIL_FIXED"
+
+        if not property_address:
+            warnings.append("MISSING_JOB_TITLE_ADDRESS")
+            missing_address_count += 1
+            status = "SKIP_UNTIL_FIXED"
+
+        if task.get("routing_group") == "DEFAULT_JOSH":
+            default_josh_count += 1
+
+        if task.get("routing_group") == "DEFAULT_MICHAEL":
+            default_michael_count += 1
+
+        if status == "CALLABLE":
+            callable_count += 1
+        else:
+            skip_count += 1
+
+        rows.append({
+            "status": status,
+            "priority_label": task.get("priority_label"),
+            "task_name": task.get("task_name"),
+            "due_date": task.get("due_date"),
+            "contact_name": task.get("contact_name"),
+
+            "default_agent": task.get("default_agent"),
+            "routing_group": task.get("routing_group"),
+            "routing_reason": task.get("routing_reason"),
+            "override_note": "David can override to Mark or Margaret by command.",
+
+            "phones_found_count": len(phones),
+            "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
+
+            "address_source": "Job Title only",
+            "address_found": bool(property_address),
+            "address_preview": mask_address(property_address) if property_address else None,
+
+            "warnings": warnings,
+            "task_id": task.get("task_id"),
+            "contact_id_present": bool(contact_id)
+        })
+
+    callable_rows = [row for row in rows if row["status"] == "CALLABLE"]
+    skip_rows = [row for row in rows if row["status"] != "CALLABLE"]
+    josh_rows = [row for row in callable_rows if row["routing_group"] == "DEFAULT_JOSH"]
+    michael_rows = [row for row in callable_rows if row["routing_group"] == "DEFAULT_MICHAEL"]
+
+    return {
+        "ok": True,
+        "buckets": buckets,
+        "contacts_requested": len(contact_ids),
+        "contacts_returned": len(contacts),
+        "rows": rows,
+        "callable_rows": callable_rows,
+        "skip_rows": skip_rows,
+        "josh_rows": josh_rows,
+        "michael_rows": michael_rows,
+        "missing_phone_count": missing_phone_count,
+        "missing_address_count": missing_address_count,
+        "default_josh_count": default_josh_count,
+        "default_michael_count": default_michael_count,
+        "callable_count": callable_count,
+        "skip_count": skip_count
     }
 
 
@@ -567,87 +692,15 @@ def crm_test():
 
 @app.route("/contact-dry-run")
 def contact_dry_run():
-    buckets = build_task_buckets()
+    report = build_contact_rows()
 
-    if not buckets["ok"]:
+    if not report["ok"]:
         return jsonify({
             "crm_connection": "failed",
             "mode": "contact-dry-run",
-            "step_failed": buckets["step_failed"],
-            "error": buckets["error"]
+            "step_failed": report["step_failed"],
+            "error": report["error"]
         }), 500
-
-    deploy_tasks = buckets["deploy_eligible_tasks"]
-
-    contact_ids = []
-    for task in deploy_tasks:
-        contact_id = task.get("contact_id")
-        if contact_id and contact_id not in contact_ids:
-            contact_ids.append(contact_id)
-
-    contacts_result = get_contacts_by_ids(contact_ids)
-
-    if not contacts_result["ok"]:
-        return jsonify({
-            "crm_connection": "failed",
-            "mode": "contact-dry-run",
-            "step_failed": "GetContactsById",
-            "error": contacts_result["error"]
-        }), 500
-
-    contacts = extract_results(contacts_result["data"])
-    contacts_by_id = {}
-
-    for contact in contacts:
-        contact_id = contact.get("ContactId")
-        if contact_id:
-            contacts_by_id[contact_id] = contact
-
-    rows = []
-
-    missing_phone_count = 0
-    missing_address_count = 0
-    needs_agent_review_count = 0
-
-    for task in deploy_tasks:
-        contact_id = task.get("contact_id")
-        contact = contacts_by_id.get(contact_id, {})
-
-        phones = extract_phones_from_contact(contact)
-        property_address = extract_property_address_from_job_title_only(contact)
-
-        warnings = []
-
-        if not phones:
-            warnings.append("MISSING_PHONE")
-            missing_phone_count += 1
-
-        if not property_address:
-            warnings.append("MISSING_JOB_TITLE_ADDRESS")
-            missing_address_count += 1
-
-        if task.get("suggested_agent") == "NEEDS_REVIEW":
-            warnings.append("AGENT_NEEDS_REVIEW")
-            needs_agent_review_count += 1
-
-        rows.append({
-            "priority_label": task.get("priority_label"),
-            "task_name": task.get("task_name"),
-            "due_date": task.get("due_date"),
-            "contact_name": task.get("contact_name"),
-            "suggested_agent": task.get("suggested_agent"),
-
-            "phones_found_count": len(phones),
-            "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
-
-            "address_source": "Job Title only",
-            "address_found": bool(property_address),
-            "address_preview": mask_address(property_address) if property_address else None,
-
-            "warnings": warnings,
-            "task_id": task.get("task_id"),
-            "contact_id_present": bool(contact_id)
-        })
 
     return jsonify({
         "crm_connection": "ok",
@@ -659,24 +712,91 @@ def contact_dry_run():
         "classification_source": "exact_task_name_only",
 
         "address_rule": "Job Title is the only property address field.",
-        "deploy_eligible_vapi_tasks_found": len(deploy_tasks),
-        "contacts_requested": len(contact_ids),
-        "contacts_returned": len(contacts),
+        "deploy_eligible_vapi_tasks_found": len(report["buckets"]["deploy_eligible_tasks"]),
+        "contacts_requested": report["contacts_requested"],
+        "contacts_returned": report["contacts_returned"],
 
-        "missing_phone_count": missing_phone_count,
-        "missing_job_title_address_count": missing_address_count,
-        "needs_agent_review_count": needs_agent_review_count,
+        "missing_phone_count": report["missing_phone_count"],
+        "missing_job_title_address_count": report["missing_address_count"],
+        "default_josh_count": report["default_josh_count"],
+        "default_michael_count": report["default_michael_count"],
+        "callable_count": report["callable_count"],
+        "skip_count": report["skip_count"],
 
         "rules": [
             "Plain RELS PC remains blacklisted from Vapi.",
             "Only exact VAPI and VAPI NEW task names are included.",
             "Property address is pulled from Job Title only.",
-            "Full phone numbers are not displayed on this public page.",
-            "Suggested agent is a dry-run guess only.",
+            "Michael and Josh are default suggestions only.",
+            "Mark and Margaret are only used when David commands it.",
             "No campaigns were created and no Vapi calls were made."
         ],
 
-        "deploy_contact_preview": rows[:75],
+        "deploy_contact_preview": report["rows"][:75],
 
         "safe": "No campaigns were created. No Vapi calls were made. Full phone numbers are hidden on this public page."
+    })
+
+
+@app.route("/morning-report")
+def morning_report():
+    report = build_contact_rows()
+
+    if not report["ok"]:
+        return jsonify({
+            "crm_connection": "failed",
+            "mode": "morning-report",
+            "step_failed": report["step_failed"],
+            "error": report["error"]
+        }), 500
+
+    buckets = report["buckets"]
+
+    return jsonify({
+        "crm_connection": "ok",
+        "mode": "morning-report",
+
+        "source": "Your Workspace → Tasks that are due → LEAD TASKS",
+        "date_filter": "overdue_plus_today",
+        "date_range_checked": {
+            "start": buckets["start_date"],
+            "end": buckets["end_date"]
+        },
+
+        "control_rule": "Report only. David gives the deployment time, skips, and agent overrides before campaigns are created.",
+
+        "summary": {
+            "vapi_tasks_due": len(buckets["deploy_eligible_tasks"]),
+            "callable_leads": report["callable_count"],
+            "skip_until_fixed": report["skip_count"],
+            "missing_phone_count": report["missing_phone_count"],
+            "missing_job_title_address_count": report["missing_address_count"],
+            "default_josh_estate_leads": len(report["josh_rows"]),
+            "default_michael_regular_leads": len(report["michael_rows"]),
+            "vapi_new_priority_tasks": buckets["vapi_new_count"],
+            "regular_vapi_tasks": buckets["vapi_regular_count"]
+        },
+
+        "default_routing_rules": [
+            "Estate/probate-looking leads default to Josh.",
+            "Regular owner/property-looking leads default to Michael.",
+            "Mark is only used when David commands it.",
+            "Margaret is only used when David commands it.",
+            "Missing phone or missing Job Title address is skipped until fixed."
+        ],
+
+        "next_instruction_needed_from_david": [
+            "What time should the campaigns start?",
+            "Should Josh handle all estate/default-Josh leads?",
+            "Should Michael handle all regular/default-Michael leads?",
+            "Any specific lead overrides to Mark?",
+            "Any specific lead overrides to Margaret?",
+            "Any leads to skip even if callable?"
+        ],
+
+        "skip_until_fixed_preview": report["skip_rows"][:25],
+        "default_josh_preview": report["josh_rows"][:50],
+        "default_michael_preview": report["michael_rows"][:50],
+
+        "safe": "Morning report only. No campaigns were created. No Vapi calls were made."
     })
