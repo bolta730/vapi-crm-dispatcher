@@ -1103,6 +1103,76 @@ def final_plan():
     })
 
 
+@app.route("/test-campaign-preview", methods=["GET"])
+def test_campaign_preview():
+    """Read CRM and build masked previews only; never invoke a Vapi write."""
+    result = {
+        "mode": "test-campaign-preview",
+        "status": "PREVIEW_ONLY",
+        "final_approval_required": True,
+        "campaigns_created": 0,
+        "vapi_calls_made": 0,
+        "start_time": None,
+        "timing": {
+            "status": "NOT_SCHEDULED",
+            "may_start_immediately_after_creation": True,
+            "note": "The current test payload has no scheduled start time. Treat FINAL creation as potentially starting calls immediately.",
+            "spacing": "No five-minute window or gap is configured for these test campaigns.",
+        },
+        "selection_rule": "First callable Josh Estate lead and first callable Michael Owner lead, using each contact's first phone number, as in the existing test action.",
+        "snapshot_warning": "This preview does not reserve leads or approve anything. The existing test action reads CRM again; leads or phone numbers may change before creation.",
+        "command_only_agents": ["Mark", "Margaret"],
+        "test_leads": [],
+        "safe": "Read-only preview. No campaigns were created. No Vapi calls were made. Query parameters cannot approve or schedule anything on this page.",
+    }
+
+    def respond(status_code):
+        response = jsonify(result)
+        response.headers["Cache-Control"] = "no-store"
+        return response, status_code
+
+    try:
+        report = build_contact_rows()
+        if not report["ok"]:
+            result.update(status="PREVIEW_UNAVAILABLE", reason="Unable to read CRM. No test leads have been confirmed.")
+            return respond(502)
+
+        for label, agent_name, key in (
+            ("Josh Estate", "Josh", "suggested_josh_estate_rows"),
+            ("Michael Owner", "Michael", "suggested_michael_owner_rows"),
+        ):
+            rows = report[key]
+            if not rows:
+                result.update(status="PREVIEW_INCOMPLETE", reason="Both test groups require a callable lead.")
+                result["test_leads"].append({"batch_label": label, "status": "NO_CALLABLE_LEAD"})
+                continue
+
+            # Same read-only payload builder as creation, but never return its
+            # private payload, raw CRM errors, phone IDs, or assistant IDs.
+            prepared = build_single_test_campaign_payload(label, agent_name, rows[0])
+            if not prepared["ok"]:
+                result.update(status="PREVIEW_INCOMPLETE", reason="A selected contact could not be validated. No test is ready for approval.")
+                result["test_leads"].append({"batch_label": label, "status": "CONTACT_VALIDATION_FAILED"})
+                continue
+
+            preview = prepared["safe_preview"]
+            result["test_leads"].append({
+                "batch_label": label,
+                "agent": agent_name,
+                "lead_name": preview["lead_name"],
+                "phone_last4": preview["phone_last4"],
+                "address_found": preview["address_found"],
+                "status": "WAITING_FOR_DAVID_REVIEW",
+            })
+    except Exception:
+        # Do not expose exception strings: CRM failures can include private data.
+        result.update(status="PREVIEW_UNAVAILABLE", reason="Unable to complete the CRM preview. No test leads have been confirmed.")
+        result["test_leads"] = []
+        return respond(502)
+
+    return respond(200 if result["status"] == "PREVIEW_ONLY" else 409)
+
+
 @app.route("/create-test-campaigns")
 def create_test_campaigns():
     approval = request.args.get("approve", "").strip()
