@@ -385,6 +385,23 @@ def extract_property_address_from_job_title_only(contact):
     return None
 
 
+def clean_address_for_speech(address):
+    """Format the spoken address without changing the source CRM value."""
+    text = str(address or "").strip()
+    if re.fullmatch(r"\d{5}(?:-\d{4})?", text):
+        return ""
+    # Preserve a leading five-digit street number; remove postal ZIP/ZIP+4.
+    text = re.sub(r"(?!\A)\b\d{5}(?:-\d{4})?\b", "", text)
+    text = re.sub(r"\bNY\b", "New York", text, flags=re.IGNORECASE)
+    text = re.sub(r"([^,\s])\s+New York\s*$", r"\1, New York", text)
+    parts = [re.sub(r"\s+", " ", part).strip()
+             for part in re.split(r"[,\r\n]+", text)]
+    parts = [part for part in parts if part]
+    if len(parts) >= 3 or (len(parts) == 2 and parts[1].lower() != "new york"):
+        return parts[0] + " in " + ", ".join(parts[1:])
+    return ", ".join(parts)
+
+
 def mask_address(address):
     text = str(address or "").strip()
 
@@ -740,7 +757,7 @@ def build_single_test_campaign_payload(batch_label, agent_name, lead_row):
         "assistantOverrides": {
             "variableValues": {
                 "name": contact_name,
-                "property_address": property_address
+                "property_address": clean_address_for_speech(property_address)
             }
         },
         "maxConcurrency": 1
