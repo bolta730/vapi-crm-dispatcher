@@ -83,7 +83,7 @@ def call_vapi_create_campaign(payload):
         "Content-Type": "application/json",
     }
 
-    primary_url = f"{VAPI_API_URL}/campaign"
+    primary_url = f"{VAPI_API_URL}/v2/campaign"
 
     try:
         response = requests.post(
@@ -103,35 +103,6 @@ def call_vapi_create_campaign(payload):
                 "ok": True,
                 "endpoint_used": primary_url,
                 "data": data
-            }
-
-        if response.status_code in [404, 405]:
-            fallback_url = f"{VAPI_API_URL}/v2/campaign"
-
-            fallback_response = requests.post(
-                fallback_url,
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-
-            try:
-                fallback_data = fallback_response.json()
-            except Exception:
-                fallback_data = {"raw_response": fallback_response.text}
-
-            if fallback_response.status_code < 400:
-                return {
-                    "ok": True,
-                    "endpoint_used": fallback_url,
-                    "data": fallback_data
-                }
-
-            return {
-                "ok": False,
-                "endpoint_used": fallback_url,
-                "status_code": fallback_response.status_code,
-                "error": fallback_data
             }
 
         return {
