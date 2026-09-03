@@ -91,5 +91,88 @@ class PreviewTests(unittest.TestCase):
         self.rows.assert_not_called()
 
 
+class ProductionCampaignPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.client = dispatcher.app.test_client()
+        self.report = {
+            "ok": True,
+            "buckets": {"deploy_eligible_tasks": [{}, {}, {}]},
+            "callable_count": 2,
+            "skip_count": 1,
+            "suggested_josh_estate_rows": [{
+                "contact_name": "Estate Lead", "task_name": "VAPI NEW",
+                "due_date": "2026-09-03", "suggested_route": "Josh Estate",
+                "phone_last4_preview": ["***0123"],
+                "address_preview": "JOB_TITLE_ADDRESS_FOUND: Albany, NY",
+                "warnings": [], "contact_id": "private-j", "task_id": "private-tj",
+            }],
+            "suggested_michael_owner_rows": [{
+                "contact_name": "Owner Lead", "task_name": "VAPI",
+                "due_date": "2026-09-03", "suggested_route": "Michael Owner",
+                "phone_last4_preview": ["***0456"],
+                "address_preview": "JOB_TITLE_ADDRESS_FOUND",
+                "warnings": [], "contact_id": "private-m", "task_id": "private-tm",
+            }],
+            "skip_rows": [{
+                "contact_name": "Incomplete Lead", "task_name": "VAPI RELS PC",
+                "due_date": "2026-09-03", "suggested_route": "Michael Owner",
+                "phone_last4_preview": [], "address_preview": None,
+                "warnings": ["MISSING_PHONE", "MISSING_JOB_TITLE_ADDRESS"],
+                "contact_id": "private-s", "task_id": "private-ts",
+            }],
+        }
+        self.vapi = self.enterContext(patch.object(dispatcher, "call_vapi_create_campaign"))
+        self.rows = self.enterContext(patch.object(dispatcher, "build_contact_rows", return_value=self.report))
+
+    def tearDown(self):
+        self.vapi.assert_not_called()
+
+    def test_campaign_preview_is_grouped_masked_and_read_only(self):
+        response = self.client.get("/campaign-preview?approve=FINAL")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["status"], "READ_ONLY_PREVIEW")
+        self.assertEqual(data["summary"], {
+            "total_vapi_tasks": 3, "callable_leads": 2,
+            "josh_estate_count": 1, "michael_owner_count": 1,
+            "skipped_count": 1,
+        })
+        self.assertEqual(data["route_groups"]["Mark"]["status"], "DAVID_COMMAND_ONLY")
+        self.assertEqual(data["route_groups"]["Margaret"]["count"], 0)
+        self.assertEqual(data["skipped_leads"][0]["warnings"], [
+            "MISSING_PHONE", "MISSING_JOB_TITLE_ADDRESS"
+        ])
+        body = response.get_data(as_text=True)
+        for private in ["private-j", "private-tj", "+12025550123", "123 Private Street"]:
+            self.assertNotIn(private, body)
+        self.assertIn("***0123", body)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_campaign_preview_post_is_rejected(self):
+        self.assertEqual(self.client.post("/campaign-preview").status_code, 405)
+        self.rows.assert_not_called()
+
+    def test_campaign_preview_redacts_crm_errors(self):
+        self.rows.return_value = {"ok": False, "error": "private CRM detail"}
+        response = self.client.get("/campaign-preview")
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("private CRM detail", response.get_data(as_text=True))
+
+    def test_only_exact_vapi_task_names_are_eligible(self):
+        exact_names = ["VAPI", "VAPI NEW", "VAPI RELS PC", "VAPI NEW RELS PC"]
+        for name in exact_names:
+            with self.subTest(name=name):
+                self.assertEqual(dispatcher.classify_task_exact_name_only(name)["bucket"], "deploy")
+
+        for name in ["VAPINEW", "VAPI RELSPC", "VAPI EXTRA", "RELS PC"]:
+            with self.subTest(name=name):
+                self.assertNotEqual(dispatcher.classify_task_exact_name_only(name)["bucket"], "deploy")
+
+        self.assertEqual(
+            dispatcher.classify_task_exact_name_only("RELS PC")["bucket"],
+            "manual_sms_only",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

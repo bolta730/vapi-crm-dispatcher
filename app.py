@@ -177,16 +177,9 @@ def get_due_tasks(start_date, end_date):
 
 def classify_task_exact_name_only(task_name):
     name = normalize_text(task_name)
-    compact = compact_text(task_name)
-
     exact_vapi_new_commands = {
         "VAPI NEW",
         "VAPI NEW RELS PC",
-    }
-
-    exact_vapi_new_compact_commands = {
-        "VAPINEW",
-        "VAPINEWRELSPC",
     }
 
     exact_vapi_commands = {
@@ -194,17 +187,11 @@ def classify_task_exact_name_only(task_name):
         "VAPI RELS PC",
     }
 
-    exact_vapi_compact_commands = {
-        "VAPI",
-        "VAPIRELSPC",
-    }
-
     rels_pc_manual_commands = {
         "RELS PC",
-        "RELSPC",
     }
 
-    if name in exact_vapi_new_commands or compact in exact_vapi_new_compact_commands:
+    if name in exact_vapi_new_commands:
         return {
             "bucket": "deploy",
             "priority_order": 1,
@@ -212,7 +199,7 @@ def classify_task_exact_name_only(task_name):
             "reason": "Exact task name is VAPI NEW or VAPI NEW RELS PC."
         }
 
-    if name in exact_vapi_commands or compact in exact_vapi_compact_commands:
+    if name in exact_vapi_commands:
         return {
             "bucket": "deploy",
             "priority_order": 2,
@@ -220,7 +207,7 @@ def classify_task_exact_name_only(task_name):
             "reason": "Exact task name is VAPI or VAPI RELS PC."
         }
 
-    if name in rels_pc_manual_commands or compact in rels_pc_manual_commands:
+    if name in rels_pc_manual_commands:
         return {
             "bucket": "manual_sms_only",
             "priority_order": 50,
@@ -1159,6 +1146,91 @@ def test_campaign_preview():
         return respond(502)
 
     return respond(200 if result["status"] == "PREVIEW_ONLY" else 409)
+
+
+def public_campaign_preview_row(row):
+    """Return only the masked fields David needs for launch review."""
+    return {
+        "lead_name": row.get("contact_name"),
+        "task_name": row.get("task_name"),
+        "due_date": row.get("due_date"),
+        "suggested_route": row.get("suggested_route"),
+        "phone_last4": row.get("phone_last4_preview", []),
+        "address_preview": row.get("address_preview"),
+        "warnings": row.get("warnings", []),
+    }
+
+
+@app.route("/campaign-preview", methods=["GET"])
+def campaign_preview():
+    """Production CRM preview. This endpoint has no Vapi write path."""
+    response_body = {
+        "status": "READ_ONLY_PREVIEW",
+        "source": "Your Workspace → Tasks that are due → LEAD TASKS",
+        "included_task_names": ["VAPI", "VAPI NEW", "VAPI RELS PC", "VAPI NEW RELS PC"],
+        "blacklisted_manual_only": ["RELS PC"],
+        "summary": {
+            "total_vapi_tasks": 0,
+            "callable_leads": 0,
+            "josh_estate_count": 0,
+            "michael_owner_count": 0,
+            "skipped_count": 0,
+        },
+        "route_groups": {
+            "Josh Estate": {"status": "SUGGESTED_ROUTE", "count": 0, "leads": []},
+            "Michael Owner": {"status": "SUGGESTED_ROUTE", "count": 0, "leads": []},
+            "Mark": {"status": "DAVID_COMMAND_ONLY", "count": 0, "leads": []},
+            "Margaret": {"status": "DAVID_COMMAND_ONLY", "count": 0, "leads": []},
+        },
+        "skipped_leads": [],
+        "safety": [
+            "READ_ONLY_PREVIEW",
+            "No campaigns were created.",
+            "No Vapi calls were made.",
+        ],
+    }
+
+    def respond(status_code):
+        response = jsonify(response_body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, status_code
+
+    try:
+        report = build_contact_rows()
+        if not report["ok"]:
+            response_body["status"] = "PREVIEW_UNAVAILABLE"
+            response_body["reason"] = "Unable to read CRM. No launch preview is available."
+            return respond(502)
+
+        buckets = report["buckets"]
+        josh_rows = report["suggested_josh_estate_rows"]
+        michael_rows = report["suggested_michael_owner_rows"]
+
+        response_body["summary"] = {
+            "total_vapi_tasks": len(buckets["deploy_eligible_tasks"]),
+            "callable_leads": report["callable_count"],
+            "josh_estate_count": len(josh_rows),
+            "michael_owner_count": len(michael_rows),
+            "skipped_count": report["skip_count"],
+        }
+        response_body["route_groups"]["Josh Estate"].update(
+            count=len(josh_rows),
+            leads=[public_campaign_preview_row(row) for row in josh_rows],
+        )
+        response_body["route_groups"]["Michael Owner"].update(
+            count=len(michael_rows),
+            leads=[public_campaign_preview_row(row) for row in michael_rows],
+        )
+        response_body["skipped_leads"] = [
+            public_campaign_preview_row(row) for row in report["skip_rows"]
+        ]
+    except Exception:
+        # CRM exceptions can contain private values, so never return their text.
+        response_body["status"] = "PREVIEW_UNAVAILABLE"
+        response_body["reason"] = "Unable to complete the CRM preview."
+        return respond(502)
+
+    return respond(200)
 
 
 @app.route("/create-test-campaigns")
