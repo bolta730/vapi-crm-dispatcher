@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, request
@@ -1231,6 +1232,130 @@ def campaign_preview():
         return respond(502)
 
     return respond(200)
+
+
+def resolve_launch_start(start, launch_date=None):
+    """Clock times mean today in New York, never an implicit next-day launch."""
+    now = datetime.now(ZoneInfo("America/New_York"))
+    match = re.fullmatch(r"(1[0-2]|[1-9])(?::([0-5][0-9]))?(AM|PM)", start.upper())
+    if not match:
+        raise ValueError("Use a start such as 9AM or 2:30PM.")
+    day = date.fromisoformat(launch_date) if launch_date else now.date()
+    hour = int(match[1]) % 12 + (12 if match[3] == "PM" else 0)
+    scheduled = datetime(day.year, day.month, day.day, hour, int(match[2] or 0),
+                         tzinfo=now.tzinfo)
+    # Reject ambiguous/nonexistent DST clock times instead of guessing.
+    if scheduled.utcoffset() != scheduled.replace(fold=1).utcoffset():
+        raise ValueError("Choose a time outside the daylight-saving clock change.")
+    if scheduled <= now + timedelta(minutes=2) or scheduled > now + timedelta(days=7):
+        raise ValueError("Start must be more than two minutes ahead and within seven days; use date=YYYY-MM-DD for a future day.")
+    return scheduled
+
+
+@app.route("/launch-campaigns", methods=["GET"])
+def launch_campaigns():
+    body = {
+        "status": "BLOCKED", "created_campaigns": [], "campaign_ids": [],
+        "selected_batches": [], "lead_counts": {},
+        "selected_start_time": request.args.get("start"),
+        "timezone": "America/New_York", "scheduled_start": None,
+        "skipped_count": 0, "crm_read": False,
+        "safety_note": "No campaigns were created. No Vapi calls were made.",
+    }
+
+    def respond(status, code, reason=None):
+        body["status"] = status
+        if reason:
+            body["reason"] = reason
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, code
+
+    # Gate before any CRM read or Vapi write, including implicit Flask HEAD.
+    if request.method != "GET" or request.args.getlist("approve") != ["FINAL"]:
+        return respond("BLOCKED", 403, "Explicit FINAL approval is required.")
+    start = request.args.get("start", "").strip()
+    if not start:
+        return respond("MISSING_START_TIME", 400)
+    batches = [
+        ("josh_estate", "Josh Estate", "Josh", "suggested_josh_estate_rows"),
+        ("michael_owner", "Michael Owner", "Michael", "suggested_michael_owner_rows"),
+    ]
+    selected = [batch for batch in batches if request.args.getlist(batch[0]) == ["yes"]]
+    body["selected_batches"] = [batch[1] for batch in selected]
+    if not selected:
+        return respond("NO_BATCH_SELECTED", 400)
+    allowed = {"approve", "start", "date", "josh_estate", "michael_owner"}
+    if any(key not in allowed or len(request.args.getlist(key)) != 1 for key in request.args):
+        return respond("INVALID_PARAMETERS", 400, "Unsupported or repeated launch parameters.")
+    if any(request.args.get(key, "no") not in ("yes", "no") for key in ("josh_estate", "michael_owner")):
+        return respond("INVALID_PARAMETERS", 400, "Batch flags must be yes or no.")
+    try:
+        scheduled = resolve_launch_start(start, request.args.get("date"))
+    except ValueError as exc:
+        return respond("INVALID_START_TIME", 400, str(exc))
+    body["scheduled_start"] = scheduled.isoformat()
+    payloads = []
+    try:
+        report = build_contact_rows()
+        if not report["ok"]:
+            return respond("CRM_UNAVAILABLE", 502)
+        body["crm_read"] = True
+        body["skipped_count"] = report["skip_count"]
+        for _, label, agent, rows_key in selected:
+            customers = []
+            for row in report[rows_key]:
+                if row.get("status") != "CALLABLE":
+                    continue
+                private = get_contact_private_data(row["contact_id"])
+                if not private["ok"]:
+                    return respond("CRM_UNAVAILABLE", 502)
+                address = clean_address_for_speech(private["property_address"])
+                if not private["phones"] or not address:
+                    body["skipped_count"] += 1
+                    continue
+                name = row.get("contact_name") or ""
+                customers.append({
+                    "number": private["phones"][0], "name": name[:40],
+                    "assistantOverrides": {"variableValues": {
+                        "name": name, "property_address": address,
+                    }},
+                })
+            body["lead_counts"][label] = len(customers)
+            if not customers:
+                return respond("NO_CALLABLE_LEADS", 409, f"No callable leads in {label}; nothing launched.")
+            if len(customers) > 10000:
+                return respond("BATCH_TOO_LARGE", 400)
+            payloads.append((label, {
+                "name": f"LIVE - {label} - {scheduled.date().isoformat()} - start {start}",
+                "assistantId": ASSISTANT_IDS[agent],
+                "phoneNumberId": VAPI_PHONE_NUMBER_ID,
+                "customers": customers, "maxConcurrency": 1,
+                "schedulePlan": {"earliestAt": scheduled.astimezone(timezone.utc).isoformat()},
+            }))
+    except Exception:
+        return respond("FAILED_BEFORE_VAPI", 502, "Unable to prepare all selected batches; nothing launched.")
+    # Prepare every batch before the first write. Never retry an uncertain create.
+    for label, payload in payloads:
+        if scheduled <= datetime.now(timezone.utc) + timedelta(minutes=1):
+            return respond("START_TIME_EXPIRED", 409, "Start is too close; check any already-created campaigns before retrying.")
+        body["safety_note"] = "Vapi creation attempted. Do not retry this URL: check Vapi first to avoid duplicate campaigns. Mark and Margaret excluded."
+        try:
+            result = call_vapi_create_campaign(payload)
+            campaign_id = result.get("data", {}).get("id") if result.get("ok") else None
+            if not campaign_id:
+                body["failed_batch"] = label
+                return respond("PARTIAL_OR_UNCONFIRMED", 502, "Stopped after an unsuccessful or uncertain Vapi response; no automatic retry.")
+        except Exception:
+            body["failed_batch"] = label
+            return respond("PARTIAL_OR_UNCONFIRMED", 502, "Creation outcome uncertain; check Vapi before retrying.")
+        body["campaign_ids"].append(campaign_id)
+        body["created_campaigns"].append({
+            "campaign_id": campaign_id, "batch_label": label,
+            "name": payload["name"], "lead_count": len(payload["customers"]),
+            "selected_start_time": start, "scheduled_start": scheduled.isoformat(),
+        })
+    return respond("SUCCESS", 200)
 
 
 @app.route("/create-test-campaigns")
