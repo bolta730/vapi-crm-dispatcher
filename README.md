@@ -7,16 +7,22 @@
 approved URL until David has reviewed `/campaign-preview` and approved launch.
 
 `start=9AM` means today at 9 AM America/New_York. Optional `date=YYYY-MM-DD`
-selects a future day. Past times, DST-ambiguous times, and starts less than two
-minutes away or more than seven days away are rejected. The resolved timestamp
-is sent as `schedulePlan.earliestAt`, not merely used as a name label.
+selects a future day. Optional `gap=5` controls the whole-minute spacing between
+contact campaigns and defaults to five minutes. Past times, DST-ambiguous times,
+and starts less than two minutes away or more than seven days away are rejected.
+Each resolved timestamp is sent as `schedulePlan.earliestAt`.
 
-Each selected batch gets one Vapi V2 campaign, concurrency 1 per campaign,
-using the preview's callable groups and the existing first-phone selection.
-Per-customer variable overrides carry each lead's name and cleaned Job Title
-address. All payloads are prepared before creation. Missing data is excluded;
-an empty selected batch or CRM read failure blocks the whole request.
-The existing preview and test routes are unchanged.
+Each callable CRM contact gets its own Vapi V2 campaign with every valid phone
+number belonging to that contact. Campaigns remain concurrency 1 and are ordered
+Josh Estate contacts first, followed by Michael Owner contacts. Per-customer
+variable overrides carry the contact's name and cleaned Job Title address. All
+payloads are prepared before creation. Missing data is excluded; an empty
+selected route group or CRM read failure blocks the whole request.
+
+`GET /campaign-preview` remains read-only. Its `planned_campaigns` list shows one
+entry per contact, the route and assistant, all masked phone last-four values,
+and campaign order. Add `start`, optional `date`, and optional `gap` to preview
+the exact campaign names and scheduled timestamps without creating anything.
 
 Safety checks (no campaign creation): omit approval; omit start with approval;
 or supply approval and start with no batches. Local tests mock Vapi and block

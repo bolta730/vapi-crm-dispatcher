@@ -21,10 +21,12 @@ class LaunchTests(unittest.TestCase):
         }
         self.rows = self.enterContext(patch.object(dispatcher, 'build_contact_rows', return_value=self.report))
         self.private = self.enterContext(patch.object(dispatcher, 'get_contact_private_data',
-            side_effect=lambda cid: {'ok': True, 'phones': ['+12025550123'],
+            side_effect=lambda cid: {'ok': True, 'phones': [f'+12025550{cid[-1]}1', f'+12025550{cid[-1]}2'],
                                     'property_address': f'12 {cid} Street, Albany, NY 12207'}))
         self.vapi = self.enterContext(patch.object(dispatcher, 'call_vapi_create_campaign',
-            side_effect=[{'ok': True, 'data': {'id': 'fake-j'}}, {'ok': True, 'data': {'id': 'fake-m'}}]))
+            side_effect=[{'ok': True, 'data': {'id': 'fake-j1'}},
+                         {'ok': True, 'data': {'id': 'fake-j2'}},
+                         {'ok': True, 'data': {'id': 'fake-m1'}}]))
         self.time = self.enterContext(patch.object(dispatcher, 'resolve_launch_start',
             return_value=datetime.now(timezone.utc) + timedelta(days=1)))
 
@@ -49,13 +51,15 @@ class LaunchTests(unittest.TestCase):
         self.private.assert_not_called()
         self.vapi.assert_not_called()
 
-    def test_both_batches_use_individual_cleaned_addresses_and_schedule(self):
+    def test_one_campaign_per_contact_all_phones_correct_routes_and_five_minute_gap(self):
         response = self.launch()
         self.assertEqual(response.json['status'], 'SUCCESS')
-        self.assertEqual(response.json['campaign_ids'], ['fake-j', 'fake-m'])
+        self.assertEqual(response.json['campaign_ids'], ['fake-j1', 'fake-j2', 'fake-m1'])
         self.assertEqual(response.json['lead_counts'], {'Josh Estate': 2, 'Michael Owner': 1})
+        self.assertEqual(response.json['gap_minutes'], 5)
         self.assertEqual(response.json['skipped_count'], 3)
-        for call, agent in zip(self.vapi.call_args_list, ['Josh', 'Michael']):
+        self.assertEqual(self.vapi.call_count, 3)
+        for call, agent in zip(self.vapi.call_args_list, ['Josh', 'Josh', 'Michael']):
             payload = call.args[0]
             self.assertEqual(payload['assistantId'], dispatcher.ASSISTANT_IDS[agent])
             self.assertEqual(payload['phoneNumberId'], dispatcher.VAPI_PHONE_NUMBER_ID)
@@ -63,14 +67,19 @@ class LaunchTests(unittest.TestCase):
             self.assertIn('earliestAt', payload['schedulePlan'])
             self.assertTrue(payload['name'].startswith('LIVE - '))
             self.assertNotIn('assistantOverrides', payload)
+            self.assertEqual(len(payload['customers']), 2)
             for customer in payload['customers']:
                 address = customer['assistantOverrides']['variableValues']['property_address']
                 self.assertNotIn('12207', address)
                 self.assertIn('New York', address)
-        addresses = [c['assistantOverrides']['variableValues']['property_address']
-                     for c in self.vapi.call_args_list[0].args[0]['customers']]
-        self.assertNotEqual(*addresses)
-        self.assertNotIn('+12025550123', response.get_data(as_text=True))
+        starts = [datetime.fromisoformat(call.args[0]['schedulePlan']['earliestAt'])
+                  for call in self.vapi.call_args_list]
+        self.assertEqual([starts[i + 1] - starts[i] for i in range(2)],
+                         [timedelta(minutes=5), timedelta(minutes=5)])
+        self.assertEqual(
+            [customer['number'] for customer in self.vapi.call_args_list[0].args[0]['customers']],
+            ['+1202555011', '+1202555012'])
+        self.assertNotIn('+1202555011', response.get_data(as_text=True))
 
     def test_only_selected_batch(self):
         self.launch('michael_owner=yes')
@@ -108,6 +117,14 @@ class LaunchTests(unittest.TestCase):
         response = self.launch()
         self.assertEqual(response.json['campaign_ids'], ['fake-j'])
         self.assertEqual(response.json['status'], 'PARTIAL_OR_UNCONFIRMED')
+
+    def test_optional_gap_is_applied(self):
+        response = self.client.get(
+            '/launch-campaigns?approve=FINAL&start=9AM&gap=7&josh_estate=yes&michael_owner=yes')
+        self.assertEqual(response.json['gap_minutes'], 7)
+        starts = [datetime.fromisoformat(call.args[0]['schedulePlan']['earliestAt'])
+                  for call in self.vapi.call_args_list]
+        self.assertEqual(starts[1] - starts[0], timedelta(minutes=7))
 
     def test_head_and_post_cannot_launch(self):
         url = '/launch-campaigns?approve=FINAL&start=9AM&josh_estate=yes'

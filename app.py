@@ -688,7 +688,7 @@ def build_contact_rows():
             "override_note": "David can command Josh Estate, Michael Owner, Mark, Margaret, or Skip.",
 
             "phones_found_count": len(phones),
-            "phone_last4_preview": [mask_phone(phone) for phone in phones[:5]],
+            "phone_last4_preview": [mask_phone(phone) for phone in phones],
 
             "address_source": "Job Title only",
             "address_found": bool(property_address),
@@ -1200,6 +1200,42 @@ def public_campaign_preview_row(row):
     }
 
 
+def parse_campaign_gap(raw_gap):
+    if raw_gap in (None, ""):
+        return 5
+    if not re.fullmatch(r"[1-9][0-9]*", raw_gap) or int(raw_gap) > 120:
+        raise ValueError("Gap must be a whole number of minutes from 1 to 120.")
+    return int(raw_gap)
+
+
+def ordered_contact_campaigns(report, selected_routes=None):
+    """Return one ordered campaign candidate per CRM contact."""
+    routes = [
+        ("Josh Estate", "Josh", "suggested_josh_estate_rows"),
+        ("Michael Owner", "Michael", "suggested_michael_owner_rows"),
+    ]
+    selected_routes = set(selected_routes or [route[0] for route in routes])
+    campaigns = []
+    seen_contact_ids = set()
+    for label, agent, rows_key in routes:
+        if label not in selected_routes:
+            continue
+        for row in report[rows_key]:
+            contact_id = row.get("contact_id")
+            if row.get("status", "CALLABLE") != "CALLABLE" or not contact_id:
+                continue
+            if contact_id in seen_contact_ids:
+                continue
+            seen_contact_ids.add(contact_id)
+            campaigns.append((label, agent, row))
+    return campaigns
+
+
+def format_campaign_clock(moment):
+    hour = moment.hour % 12 or 12
+    return f"{hour}:{moment.minute:02d}{'AM' if moment.hour < 12 else 'PM'}"
+
+
 @app.route("/campaign-preview", methods=["GET"])
 def campaign_preview():
     """Production CRM preview. This endpoint has no Vapi write path."""
@@ -1215,6 +1251,10 @@ def campaign_preview():
             "michael_owner_count": 0,
             "skipped_count": 0,
         },
+        "campaign_structure": "One campaign per CRM contact; every valid phone number for that contact is included.",
+        "gap_minutes": 5,
+        "scheduled_start": None,
+        "planned_campaigns": [],
         "route_groups": {
             "Josh Estate": {"status": "SUGGESTED_ROUTE", "count": 0, "leads": []},
             "Michael Owner": {"status": "SUGGESTED_ROUTE", "count": 0, "leads": []},
@@ -1235,6 +1275,14 @@ def campaign_preview():
         return response, status_code
 
     try:
+        gap = parse_campaign_gap(request.args.get("gap"))
+        response_body["gap_minutes"] = gap
+        preview_start = None
+        if request.args.get("start", "").strip():
+            preview_start = resolve_launch_start(
+                request.args["start"].strip(), request.args.get("date")
+            )
+            response_body["scheduled_start"] = preview_start.isoformat()
         report = build_contact_rows()
         if not report["ok"]:
             response_body["status"] = "PREVIEW_UNAVAILABLE"
@@ -1263,6 +1311,30 @@ def campaign_preview():
         response_body["skipped_leads"] = [
             public_campaign_preview_row(row) for row in report["skip_rows"]
         ]
+        for index, (label, agent, row) in enumerate(ordered_contact_campaigns(report)):
+            planned_at = preview_start + timedelta(minutes=index * gap) if preview_start else None
+            clock = format_campaign_clock(planned_at) if planned_at else None
+            campaign_name = None
+            if planned_at:
+                campaign_name = (
+                    f"LIVE - {label} - {row.get('contact_name') or ''} - "
+                    f"{planned_at.date().isoformat()} - start {clock}"
+                )
+            response_body["planned_campaigns"].append({
+                "campaign_order": index + 1,
+                "campaign_name": campaign_name,
+                "route": label,
+                "agent": agent,
+                "lead_name": row.get("contact_name"),
+                "phone_count": row.get("phones_found_count", len(row.get("phone_last4_preview", []))),
+                "phone_last4": row.get("phone_last4_preview", []),
+                "scheduled_start": planned_at.isoformat() if planned_at else None,
+            })
+        response_body["summary"]["contact_campaign_count"] = len(response_body["planned_campaigns"])
+    except ValueError as exc:
+        response_body["status"] = "INVALID_PREVIEW_PARAMETERS"
+        response_body["reason"] = str(exc)
+        return respond(400)
     except Exception:
         # CRM exceptions can contain private values, so never return their text.
         response_body["status"] = "PREVIEW_UNAVAILABLE"
@@ -1297,6 +1369,7 @@ def launch_campaigns():
         "selected_batches": [], "lead_counts": {},
         "selected_start_time": request.args.get("start"),
         "timezone": "America/New_York", "scheduled_start": None,
+        "gap_minutes": None,
         "skipped_count": 0, "crm_read": False,
         "safety_note": "No campaigns were created. No Vapi calls were made.",
     }
@@ -1323,16 +1396,18 @@ def launch_campaigns():
     body["selected_batches"] = [batch[1] for batch in selected]
     if not selected:
         return respond("NO_BATCH_SELECTED", 400)
-    allowed = {"approve", "start", "date", "josh_estate", "michael_owner"}
+    allowed = {"approve", "start", "date", "gap", "josh_estate", "michael_owner"}
     if any(key not in allowed or len(request.args.getlist(key)) != 1 for key in request.args):
         return respond("INVALID_PARAMETERS", 400, "Unsupported or repeated launch parameters.")
     if any(request.args.get(key, "no") not in ("yes", "no") for key in ("josh_estate", "michael_owner")):
         return respond("INVALID_PARAMETERS", 400, "Batch flags must be yes or no.")
     try:
+        gap = parse_campaign_gap(request.args.get("gap"))
         scheduled = resolve_launch_start(start, request.args.get("date"))
     except ValueError as exc:
         return respond("INVALID_START_TIME", 400, str(exc))
     body["scheduled_start"] = scheduled.isoformat()
+    body["gap_minutes"] = gap
     payloads = []
     try:
         report = build_contact_rows()
@@ -1340,42 +1415,47 @@ def launch_campaigns():
             return respond("CRM_UNAVAILABLE", 502)
         body["crm_read"] = True
         body["skipped_count"] = report["skip_count"]
-        for _, label, agent, rows_key in selected:
-            customers = []
-            for row in report[rows_key]:
-                if row.get("status") != "CALLABLE":
-                    continue
-                private = get_contact_private_data(row["contact_id"])
-                if not private["ok"]:
-                    return respond("CRM_UNAVAILABLE", 502)
-                address = clean_address_for_speech(private["property_address"])
-                if not private["phones"] or not address:
-                    body["skipped_count"] += 1
-                    continue
-                name = row.get("contact_name") or ""
-                customers.append({
-                    "number": private["phones"][0], "name": name[:40],
-                    "assistantOverrides": {"variableValues": {
-                        "name": name, "property_address": address,
-                    }},
-                })
-            body["lead_counts"][label] = len(customers)
-            if not customers:
+        selected_labels = [batch[1] for batch in selected]
+        contact_campaigns = ordered_contact_campaigns(report, selected_labels)
+        for label in selected_labels:
+            body["lead_counts"][label] = 0
+            if not any(item[0] == label for item in contact_campaigns):
                 return respond("NO_CALLABLE_LEADS", 409, f"No callable leads in {label}; nothing launched.")
-            if len(customers) > 10000:
+        for label, agent, row in contact_campaigns:
+            private = get_contact_private_data(row["contact_id"])
+            if not private["ok"]:
+                return respond("CRM_UNAVAILABLE", 502)
+            address = clean_address_for_speech(private["property_address"])
+            phones = private["phones"]
+            if not phones or not address:
+                body["skipped_count"] += 1
+                continue
+            if len(phones) > 10000:
                 return respond("BATCH_TOO_LARGE", 400)
-            payloads.append((label, {
-                "name": f"LIVE - {label} - {scheduled.date().isoformat()} - start {start}",
+            name = row.get("contact_name") or ""
+            customers = [{
+                "number": phone, "name": name[:40],
+                "assistantOverrides": {"variableValues": {
+                    "name": name, "property_address": address,
+                }},
+            } for phone in phones]
+            campaign_start = scheduled + timedelta(minutes=len(payloads) * gap)
+            payloads.append((label, campaign_start, {
+                "name": f"LIVE - {label} - {name} - {campaign_start.date().isoformat()} - start {format_campaign_clock(campaign_start)}",
                 "assistantId": ASSISTANT_IDS[agent],
                 "phoneNumberId": VAPI_PHONE_NUMBER_ID,
                 "customers": customers, "maxConcurrency": 1,
-                "schedulePlan": {"earliestAt": scheduled.astimezone(timezone.utc).isoformat()},
+                "schedulePlan": {"earliestAt": campaign_start.astimezone(timezone.utc).isoformat()},
             }))
+            body["lead_counts"][label] += 1
+        for label in selected_labels:
+            if body["lead_counts"][label] == 0:
+                return respond("NO_CALLABLE_LEADS", 409, f"No callable leads in {label}; nothing launched.")
     except Exception:
         return respond("FAILED_BEFORE_VAPI", 502, "Unable to prepare all selected batches; nothing launched.")
     # Prepare every batch before the first write. Never retry an uncertain create.
-    for label, payload in payloads:
-        if scheduled <= datetime.now(timezone.utc) + timedelta(minutes=1):
+    for label, campaign_start, payload in payloads:
+        if campaign_start <= datetime.now(timezone.utc) + timedelta(minutes=1):
             return respond("START_TIME_EXPIRED", 409, "Start is too close; check any already-created campaigns before retrying.")
         body["safety_note"] = "Vapi creation attempted. Do not retry this URL: check Vapi first to avoid duplicate campaigns. Mark and Margaret excluded."
         try:
@@ -1391,7 +1471,7 @@ def launch_campaigns():
         body["created_campaigns"].append({
             "campaign_id": campaign_id, "batch_label": label,
             "name": payload["name"], "lead_count": len(payload["customers"]),
-            "selected_start_time": start, "scheduled_start": scheduled.isoformat(),
+            "selected_start_time": start, "scheduled_start": campaign_start.isoformat(),
         })
     return respond("SUCCESS", 200)
 

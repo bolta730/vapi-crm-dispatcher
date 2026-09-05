@@ -102,7 +102,8 @@ class ProductionCampaignPreviewTests(unittest.TestCase):
             "suggested_josh_estate_rows": [{
                 "contact_name": "Estate Lead", "task_name": "VAPI NEW",
                 "due_date": "2026-09-03", "suggested_route": "Josh Estate",
-                "phone_last4_preview": ["***0123"],
+                "phone_last4_preview": ["***0123", "***9999"],
+                "phones_found_count": 2,
                 "address_preview": "JOB_TITLE_ADDRESS_FOUND: Albany, NY",
                 "warnings": [], "contact_id": "private-j", "task_id": "private-tj",
             }],
@@ -110,6 +111,7 @@ class ProductionCampaignPreviewTests(unittest.TestCase):
                 "contact_name": "Owner Lead", "task_name": "VAPI",
                 "due_date": "2026-09-03", "suggested_route": "Michael Owner",
                 "phone_last4_preview": ["***0456"],
+                "phones_found_count": 1,
                 "address_preview": "JOB_TITLE_ADDRESS_FOUND",
                 "warnings": [], "contact_id": "private-m", "task_id": "private-tm",
             }],
@@ -135,8 +137,15 @@ class ProductionCampaignPreviewTests(unittest.TestCase):
         self.assertEqual(data["summary"], {
             "total_vapi_tasks": 3, "callable_leads": 2,
             "josh_estate_count": 1, "michael_owner_count": 1,
-            "skipped_count": 1,
+            "skipped_count": 1, "contact_campaign_count": 2,
         })
+        self.assertEqual(
+            [(item["lead_name"], item["route"], item["phone_last4"])
+             for item in data["planned_campaigns"]],
+            [("Estate Lead", "Josh Estate", ["***0123", "***9999"]),
+             ("Owner Lead", "Michael Owner", ["***0456"])],
+        )
+        self.assertTrue(all(item["scheduled_start"] is None for item in data["planned_campaigns"]))
         self.assertEqual(data["route_groups"]["Mark"]["status"], "DAVID_COMMAND_ONLY")
         self.assertEqual(data["route_groups"]["Margaret"]["count"], 0)
         self.assertEqual(data["skipped_leads"][0]["warnings"], [
@@ -147,6 +156,18 @@ class ProductionCampaignPreviewTests(unittest.TestCase):
             self.assertNotIn(private, body)
         self.assertIn("***0123", body)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_campaign_preview_shows_scheduled_contact_order(self):
+        future = dispatcher.datetime.now(dispatcher.ZoneInfo("America/New_York")) + dispatcher.timedelta(days=1)
+        with patch.object(dispatcher, "resolve_launch_start", return_value=future.replace(second=0, microsecond=0)):
+            data = self.client.get("/campaign-preview?start=9AM&gap=5").get_json()
+        first, second = data["planned_campaigns"]
+        self.assertEqual(first["campaign_order"], 1)
+        self.assertEqual(second["campaign_order"], 2)
+        self.assertEqual(dispatcher.datetime.fromisoformat(second["scheduled_start"]) -
+                         dispatcher.datetime.fromisoformat(first["scheduled_start"]),
+                         dispatcher.timedelta(minutes=5))
+        self.assertIn("Estate Lead", first["campaign_name"])
 
     def test_campaign_preview_post_is_rejected(self):
         self.assertEqual(self.client.post("/campaign-preview").status_code, 405)
