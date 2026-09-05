@@ -1,6 +1,8 @@
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import requests
@@ -117,6 +119,42 @@ def call_vapi_create_campaign(payload):
         return {
             "ok": False,
             "error": str(exc)
+        }
+
+
+def call_vapi_read(path):
+    """Read one Vapi resource. Reporting code must never use a write method."""
+    api_key = os.getenv("VAPI_API_KEY")
+
+    if not api_key:
+        return {
+            "ok": False,
+            "error": "Missing VAPI_API_KEY in Render environment variables."
+        }
+
+    try:
+        response = requests.get(
+            f"{VAPI_API_URL}/{path.lstrip('/')}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "error": "Vapi could not return the requested read-only resource.",
+            }
+
+        return {"ok": True, "data": data}
+    except Exception:
+        return {
+            "ok": False,
+            "error": "Vapi could not be reached for the read-only report.",
         }
 
 
@@ -1356,6 +1394,212 @@ def launch_campaigns():
             "selected_start_time": start, "scheduled_start": scheduled.isoformat(),
         })
     return respond("SUCCESS", 200)
+
+
+POST_CALL_SAFETY = [
+    "READ_ONLY_POST_CALL_REPORT",
+    "No campaigns were created.",
+    "No Vapi calls were made.",
+]
+
+
+def valid_uuid(value):
+    try:
+        return str(UUID(value)) == value.lower()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def last_four(number):
+    digits = re.sub(r"\D", "", str(number or ""))
+    return digits[-4:] if digits else None
+
+
+def duration_seconds(call):
+    try:
+        started = datetime.fromisoformat(call["startedAt"].replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(call["endedAt"].replace("Z", "+00:00"))
+        return max(0, round((ended - started).total_seconds(), 2))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def campaign_call_ids(campaign):
+    calls = campaign.get("calls") or {}
+    if isinstance(calls, dict):
+        return list(calls.keys())
+    if isinstance(calls, list):
+        return [item.get("id") if isinstance(item, dict) else item for item in calls]
+    return []
+
+
+def public_call_report(call_id, result):
+    if not result.get("ok") or not isinstance(result.get("data"), dict):
+        return {
+            "call_id": call_id,
+            "status": "READ_ERROR",
+            "lead_customer_name": None,
+            "phone_last4": None,
+            "duration_seconds": None,
+            "transcript_available": False,
+            "recording_url_available": False,
+            "answered_human": None,
+            "error_message": result.get("error", "Unable to read call details."),
+        }
+
+    call = result["data"]
+    customer = call.get("customer") if isinstance(call.get("customer"), dict) else {}
+    artifact = call.get("artifact") if isinstance(call.get("artifact"), dict) else {}
+    transcript = artifact.get("transcript") or call.get("transcript")
+    messages = artifact.get("messages") or call.get("messages") or []
+    has_customer_speech = any(
+        isinstance(message, dict)
+        and str(message.get("role") or message.get("speaker") or "").lower()
+        in {"user", "customer"}
+        and bool(message.get("message") or message.get("content") or message.get("text"))
+        for message in messages
+    )
+    ended_reason = call.get("endedReason")
+    voicemail = str(ended_reason or "").lower() == "voicemail"
+    failed = call.get("status") == "failed" or any(
+        marker in str(ended_reason or "").lower()
+        for marker in ("error", "failed", "rejected", "blocked", "invalid", "not-found")
+    )
+    return {
+        "call_id": call.get("id") or call_id,
+        "status": call.get("status"),
+        "ended_reason": ended_reason,
+        "lead_customer_name": customer.get("name"),
+        "phone_last4": last_four(customer.get("number")),
+        "started_at": call.get("startedAt"),
+        "ended_at": call.get("endedAt"),
+        "duration_seconds": duration_seconds(call),
+        "voicemail": voicemail,
+        "answered_human": has_customer_speech if not voicemail else False,
+        "failed": failed,
+        "transcript_available": bool(transcript),
+        "recording_url_available": bool(
+            artifact.get("recordingUrl")
+            or artifact.get("stereoRecordingUrl")
+            or call.get("recordingUrl")
+        ),
+        "error_message": call.get("endedMessage"),
+    }
+
+
+def build_post_call_campaign_report(batch_label, campaign_id):
+    campaign_result = call_vapi_read(f"campaign/{campaign_id}")
+    if not campaign_result.get("ok") or not isinstance(campaign_result.get("data"), dict):
+        return {
+            "campaign_id": campaign_id,
+            "batch_label": batch_label,
+            "campaign_name": None,
+            "campaign_status": "READ_ERROR",
+            "total_calls": 0,
+            "completed_calls": 0,
+            "voicemail_count": None,
+            "answered_human_calls": None,
+            "failed_calls": 0,
+            "total_duration_seconds": None,
+            "call_ids": [],
+            "calls": [],
+            "error_messages": [campaign_result.get("error", "Unable to read campaign.")],
+        }
+
+    campaign = campaign_result["data"]
+    call_ids = [call_id for call_id in campaign_call_ids(campaign) if isinstance(call_id, str)]
+    calls = []
+    if call_ids:
+        with ThreadPoolExecutor(max_workers=min(8, len(call_ids))) as executor:
+            futures = {
+                executor.submit(call_vapi_read, f"call/{call_id}"): call_id
+                for call_id in call_ids
+            }
+            for future in as_completed(futures):
+                call_id = futures[future]
+                try:
+                    calls.append(public_call_report(call_id, future.result()))
+                except Exception:
+                    calls.append(public_call_report(call_id, {"ok": False}))
+        order = {call_id: index for index, call_id in enumerate(call_ids)}
+        calls.sort(key=lambda item: order.get(item["call_id"], len(order)))
+
+    durations = [item["duration_seconds"] for item in calls if item["duration_seconds"] is not None]
+    human_values = [item.get("answered_human") for item in calls]
+    errors = [item["error_message"] for item in calls if item.get("error_message")]
+    total_calls = len(call_ids) or len(campaign.get("customers") or [])
+    return {
+        "campaign_id": campaign.get("id") or campaign_id,
+        "campaign_name": campaign.get("name"),
+        "batch_label": batch_label,
+        "campaign_status": campaign.get("status"),
+        "total_calls": total_calls,
+        "completed_calls": campaign.get("callsCounterEnded", sum(item.get("status") == "ended" for item in calls)),
+        "voicemail_count": campaign.get("callsCounterEndedVoicemail"),
+        "answered_human_calls": (
+            sum(value is True for value in human_values)
+            if any(value is not None for value in human_values) else None
+        ),
+        "failed_calls": sum(item.get("failed") is True or item.get("status") == "READ_ERROR" for item in calls),
+        "total_duration_seconds": round(sum(durations), 2) if durations else None,
+        "average_duration_seconds": round(sum(durations) / len(durations), 2) if durations else None,
+        "call_ids": call_ids,
+        "calls": calls,
+        "error_messages": errors,
+    }
+
+
+@app.route("/post-call-report", methods=["GET"])
+def post_call_report():
+    """Read-only AM/PM campaign results with phone numbers always masked."""
+    body = {
+        "status": "READ_ONLY_POST_CALL_REPORT",
+        "campaign_ids": {},
+        "campaigns": [],
+        "safety": POST_CALL_SAFETY,
+    }
+
+    def respond(code):
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, code
+
+    allowed = {"josh_campaign_id", "michael_campaign_id"}
+    if any(key not in allowed or len(request.args.getlist(key)) != 1 for key in request.args):
+        body.update(
+            status="INVALID_PARAMETERS",
+            error="Use each supported campaign ID parameter at most once.",
+        )
+        return respond(400)
+
+    requested = [
+        ("Josh Estate", request.args.get("josh_campaign_id", "").strip()),
+        ("Michael Owner", request.args.get("michael_campaign_id", "").strip()),
+    ]
+    requested = [(label, campaign_id) for label, campaign_id in requested if campaign_id]
+    if not requested:
+        body.update(
+            status="MISSING_CAMPAIGN_IDS",
+            error="Provide josh_campaign_id, michael_campaign_id, or both.",
+            example="/post-call-report?josh_campaign_id=<campaign-uuid>&michael_campaign_id=<campaign-uuid>",
+        )
+        return respond(400)
+    if any(not valid_uuid(campaign_id) for _, campaign_id in requested):
+        body.update(status="INVALID_CAMPAIGN_ID", error="Each campaign ID must be a valid UUID.")
+        return respond(400)
+
+    body["campaign_ids"] = {
+        "josh_campaign_id" if label == "Josh Estate" else "michael_campaign_id": campaign_id
+        for label, campaign_id in requested
+    }
+    body["campaigns"] = [
+        build_post_call_campaign_report(label, campaign_id)
+        for label, campaign_id in requested
+    ]
+    if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
+        body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
+        return respond(502)
+    return respond(200)
 
 
 @app.route("/create-test-campaigns")

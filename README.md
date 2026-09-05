@@ -27,3 +27,15 @@ to this endpoint can supply it. Do not share complete launch URLs or refresh
 them: requests are not deduplicated across launches. After a timeout or partial
 result, inspect Vapi before retrying. This endpoint does not verify recipient
 consent; David must approve the audience and calling time before launch.
+
+## Read-only post-call report
+
+`GET /post-call-report` accepts `josh_campaign_id`, `michael_campaign_id`, or
+both. It reads each Vapi campaign and its call records, then returns campaign
+counters plus masked per-call results. Phone numbers are limited to the last
+four digits; transcripts and recording URLs are reported only as available or
+unavailable.
+
+This route contains only Vapi GET requests. It cannot create campaigns, place
+calls, or update Vapi configuration. A request with no campaign IDs returns a
+helpful 400 response before reading Vapi.
