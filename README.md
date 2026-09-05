@@ -39,3 +39,14 @@ unavailable.
 This route contains only Vapi GET requests. It cannot create campaigns, place
 calls, or update Vapi configuration. A request with no campaign IDs returns a
 helpful 400 response before reading Vapi.
+
+## Read-only call QA report
+
+`GET /call-qa-report?call_ids=ID1,ID2,ID3` reads up to 50 Vapi call records and
+returns masked customer identity, status and end reason, duration, voicemail and
+human-answer indicators, recording/transcript availability, bounded transcript
+and message detail, and Vapi's summary/success evaluation when available.
+
+The endpoint uses only Vapi GET requests. It cannot create campaigns or calls,
+or modify prompts, settings, transfers, or routing. Missing, malformed,
+duplicate, repeated, and unknown parameters are rejected before any Vapi read.

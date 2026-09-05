@@ -1402,6 +1402,19 @@ POST_CALL_SAFETY = [
     "No Vapi calls were made.",
 ]
 
+CALL_QA_SAFETY = [
+    "READ_ONLY_CALL_QA_REPORT",
+    "Only Vapi call records were read.",
+    "No campaigns were created.",
+    "No calls were made.",
+    "No Vapi prompts, settings, transfers, or routing were changed.",
+]
+
+MAX_QA_CALL_IDS = 50
+MAX_QA_TRANSCRIPT_CHARS = 30000
+MAX_QA_MESSAGES = 250
+MAX_QA_MESSAGE_CHARS = 4000
+
 
 def valid_uuid(value):
     try:
@@ -1484,6 +1497,65 @@ def public_call_report(call_id, result):
             or call.get("recordingUrl")
         ),
         "error_message": call.get("endedMessage"),
+    }
+
+
+def qa_message(message):
+    """Return only conversation fields useful for QA, excluding tool/config data."""
+    if not isinstance(message, dict):
+        return None
+    text = message.get("message") or message.get("content") or message.get("text")
+    if isinstance(text, list):
+        text = " ".join(
+            str(part.get("text") or "") if isinstance(part, dict) else str(part)
+            for part in text
+        ).strip()
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return {
+        "role": message.get("role") or message.get("speaker"),
+        "text": text[:MAX_QA_MESSAGE_CHARS],
+        "time_seconds": message.get("secondsFromStart") or message.get("time"),
+        "duration_seconds": message.get("duration"),
+    }
+
+
+def public_call_qa_report(call_id, result):
+    """Build a bounded, phone-masked diagnostic view of one Vapi call."""
+    base = public_call_report(call_id, result)
+    if not result.get("ok") or not isinstance(result.get("data"), dict):
+        return {
+            **base,
+            "voicemail": None,
+            "failed": True,
+            "customer_speech_detected": None,
+            "assistant_speech_detected": None,
+            "transcript": None,
+            "transcript_truncated": False,
+            "messages": [],
+            "analysis": {},
+        }
+
+    call = result["data"]
+    artifact = call.get("artifact") if isinstance(call.get("artifact"), dict) else {}
+    raw_messages = artifact.get("messages") or call.get("messages") or []
+    messages = [item for item in (qa_message(message) for message in raw_messages) if item]
+    transcript = artifact.get("transcript") or call.get("transcript")
+    transcript = transcript if isinstance(transcript, str) else None
+    analysis = call.get("analysis") if isinstance(call.get("analysis"), dict) else {}
+    roles = {str(item.get("role") or "").lower() for item in messages}
+    return {
+        **base,
+        "customer_speech_detected": bool(roles & {"user", "customer"}),
+        "assistant_speech_detected": bool(roles & {"assistant", "bot"}),
+        "transcript": transcript[:MAX_QA_TRANSCRIPT_CHARS] if transcript else None,
+        "transcript_truncated": bool(transcript and len(transcript) > MAX_QA_TRANSCRIPT_CHARS),
+        "messages": messages[:MAX_QA_MESSAGES],
+        "messages_truncated": len(messages) > MAX_QA_MESSAGES,
+        "analysis": {
+            "summary": analysis.get("summary"),
+            "success_evaluation": analysis.get("successEvaluation"),
+        },
     }
 
 
@@ -1597,6 +1669,70 @@ def post_call_report():
         for label, campaign_id in requested
     ]
     if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
+        body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
+        return respond(502)
+    return respond(200)
+
+
+@app.route("/call-qa-report", methods=["GET"])
+def call_qa_report():
+    """Read-only call detail for QA; never returns a full customer phone number."""
+    body = {
+        "status": "READ_ONLY_CALL_QA_REPORT",
+        "requested_call_ids": [],
+        "calls": [],
+        "safety": CALL_QA_SAFETY,
+    }
+
+    def respond(code):
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, code
+
+    if set(request.args) - {"call_ids"} or len(request.args.getlist("call_ids")) > 1:
+        body.update(
+            status="INVALID_PARAMETERS",
+            error="Provide exactly one call_ids parameter containing comma-separated call UUIDs.",
+        )
+        return respond(400)
+
+    raw_ids = request.args.get("call_ids", "")
+    call_ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
+    if not call_ids:
+        body.update(
+            status="MISSING_CALL_IDS",
+            error="Provide one or more comma-separated Vapi call IDs in call_ids.",
+            example="/call-qa-report?call_ids=<call-uuid-1>,<call-uuid-2>",
+        )
+        return respond(400)
+    if len(call_ids) > MAX_QA_CALL_IDS:
+        body.update(
+            status="TOO_MANY_CALL_IDS",
+            error=f"Provide no more than {MAX_QA_CALL_IDS} call IDs per report.",
+        )
+        return respond(400)
+    if len(set(call_ids)) != len(call_ids):
+        body.update(status="DUPLICATE_CALL_ID", error="Each call ID may appear only once.")
+        return respond(400)
+    if any(not valid_uuid(call_id) for call_id in call_ids):
+        body.update(status="INVALID_CALL_ID", error="Each call ID must be a valid UUID.")
+        return respond(400)
+
+    body["requested_call_ids"] = call_ids
+    with ThreadPoolExecutor(max_workers=min(8, len(call_ids))) as executor:
+        futures = {
+            executor.submit(call_vapi_read, f"call/{call_id}"): call_id
+            for call_id in call_ids
+        }
+        reports = {}
+        for future in as_completed(futures):
+            call_id = futures[future]
+            try:
+                reports[call_id] = public_call_qa_report(call_id, future.result())
+            except Exception:
+                reports[call_id] = public_call_qa_report(call_id, {"ok": False})
+    body["calls"] = [reports[call_id] for call_id in call_ids]
+    if any(item["status"] == "READ_ERROR" for item in body["calls"]):
         body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         return respond(502)
     return respond(200)
