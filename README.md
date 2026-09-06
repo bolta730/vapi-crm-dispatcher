@@ -36,11 +36,19 @@ consent; David must approve the audience and calling time before launch.
 
 ## Read-only post-call report
 
-`GET /post-call-report` accepts `josh_campaign_id`, `michael_campaign_id`, or
-both. It reads each Vapi campaign and its call records, then returns campaign
-counters plus masked per-call results. Phone numbers are limited to the last
-four digits; transcripts and recording URLs are reported only as available or
-unavailable.
+`GET /post-call-report` accepts repeated or comma-separated `campaign_ids`.
+The legacy `josh_campaign_id` and `michael_campaign_id` parameters also accept
+repeated or comma-separated values and may be combined with `campaign_ids`.
+It reads every requested Vapi campaign and its call records, then returns
+campaign counters plus masked per-call results. Phone numbers are limited to
+the last four digits; transcripts and recording URLs are reported only as
+available or unavailable.
+
+Examples:
+
+`/post-call-report?campaign_ids=ID1,ID2,ID3,ID4`
+
+`/post-call-report?campaign_ids=ID1&campaign_ids=ID2`
 
 This route contains only Vapi GET requests. It cannot create campaigns, place
 calls, or update Vapi configuration. A request with no campaign IDs returns a

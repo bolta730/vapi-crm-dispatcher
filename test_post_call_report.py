@@ -6,6 +6,9 @@ import app as dispatcher
 
 
 JOSH_ID = "376813ed-0dc0-4ee6-9ee8-724de9363ecb"
+SECOND_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+THIRD_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+FOURTH_ID = "cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa"
 CALL_ID = "11111111-2222-4333-8444-555555555555"
 
 
@@ -82,6 +85,56 @@ class PostCallReportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["status"], "INVALID_CAMPAIGN_ID")
         get.assert_not_called()
+
+    @patch.object(dispatcher, "build_post_call_campaign_report")
+    def test_comma_separated_campaign_ids_return_all_campaigns(self, build_report):
+        ids = [JOSH_ID, SECOND_ID, THIRD_ID, FOURTH_ID]
+        build_report.side_effect = lambda label, campaign_id: {
+            "campaign_id": campaign_id,
+            "batch_label": label,
+            "campaign_status": "ended",
+        }
+
+        response = self.client.get(f"/post-call-report?campaign_ids={','.join(ids)}")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["requested_campaign_ids"], ids)
+        self.assertEqual([item["campaign_id"] for item in body["campaigns"]], ids)
+        self.assertEqual(build_report.call_count, 4)
+
+    @patch.object(dispatcher, "build_post_call_campaign_report")
+    def test_repeated_and_legacy_parameters_are_supported(self, build_report):
+        build_report.side_effect = lambda label, campaign_id: {
+            "campaign_id": campaign_id,
+            "batch_label": label,
+            "campaign_status": "ended",
+        }
+
+        response = self.client.get(
+            f"/post-call-report?josh_campaign_id={JOSH_ID}"
+            f"&josh_campaign_id={SECOND_ID},{THIRD_ID}"
+            f"&michael_campaign_id={FOURTH_ID}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(
+            body["requested_campaign_ids"],
+            [JOSH_ID, SECOND_ID, THIRD_ID, FOURTH_ID],
+        )
+        self.assertEqual(body["campaign_ids"]["josh_campaign_id"], [JOSH_ID, SECOND_ID, THIRD_ID])
+        self.assertEqual(body["campaign_ids"]["michael_campaign_id"], [FOURTH_ID])
+
+    @patch.object(dispatcher, "build_post_call_campaign_report")
+    def test_duplicate_campaign_id_is_rejected_before_vapi_read(self, build_report):
+        response = self.client.get(
+            f"/post-call-report?campaign_ids={JOSH_ID}&campaign_ids={JOSH_ID}"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["status"], "DUPLICATE_CAMPAIGN_ID")
+        build_report.assert_not_called()
 
 
 if __name__ == "__main__":

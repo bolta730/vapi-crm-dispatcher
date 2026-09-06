@@ -1491,6 +1491,7 @@ CALL_QA_SAFETY = [
 ]
 
 MAX_QA_CALL_IDS = 50
+MAX_POST_CALL_CAMPAIGN_IDS = 50
 MAX_QA_TRANSCRIPT_CHARS = 30000
 MAX_QA_MESSAGES = 250
 MAX_QA_MESSAGE_CHARS = 4000
@@ -1707,6 +1708,7 @@ def post_call_report():
     body = {
         "status": "READ_ONLY_POST_CALL_REPORT",
         "campaign_ids": {},
+        "requested_campaign_ids": [],
         "campaigns": [],
         "safety": POST_CALL_SAFETY,
     }
@@ -1716,34 +1718,51 @@ def post_call_report():
         response.headers["Cache-Control"] = "no-store"
         return response, code
 
-    allowed = {"josh_campaign_id", "michael_campaign_id"}
-    if any(key not in allowed or len(request.args.getlist(key)) != 1 for key in request.args):
+    labels = {
+        "josh_campaign_id": "Josh Estate",
+        "michael_campaign_id": "Michael Owner",
+        "campaign_ids": "Campaign",
+    }
+    if any(key not in labels for key in request.args):
         body.update(
             status="INVALID_PARAMETERS",
-            error="Use each supported campaign ID parameter at most once.",
+            error="Use only campaign_ids, josh_campaign_id, and michael_campaign_id.",
         )
         return respond(400)
 
-    requested = [
-        ("Josh Estate", request.args.get("josh_campaign_id", "").strip()),
-        ("Michael Owner", request.args.get("michael_campaign_id", "").strip()),
-    ]
-    requested = [(label, campaign_id) for label, campaign_id in requested if campaign_id]
+    requested = []
+    ids_by_parameter = {}
+    for parameter, label in labels.items():
+        values = []
+        for raw_value in request.args.getlist(parameter):
+            values.extend(value.strip() for value in raw_value.split(",") if value.strip())
+        if values:
+            ids_by_parameter[parameter] = values
+            requested.extend((label, campaign_id) for campaign_id in values)
+
     if not requested:
         body.update(
             status="MISSING_CAMPAIGN_IDS",
-            error="Provide josh_campaign_id, michael_campaign_id, or both.",
-            example="/post-call-report?josh_campaign_id=<campaign-uuid>&michael_campaign_id=<campaign-uuid>",
+            error="Provide campaign_ids, josh_campaign_id, michael_campaign_id, or a combination.",
+            example="/post-call-report?campaign_ids=<campaign-uuid-1>,<campaign-uuid-2>",
         )
+        return respond(400)
+    if len(requested) > MAX_POST_CALL_CAMPAIGN_IDS:
+        body.update(
+            status="TOO_MANY_CAMPAIGN_IDS",
+            error=f"Provide no more than {MAX_POST_CALL_CAMPAIGN_IDS} campaign IDs per report.",
+        )
+        return respond(400)
+    requested_ids = [campaign_id for _, campaign_id in requested]
+    if len(set(requested_ids)) != len(requested_ids):
+        body.update(status="DUPLICATE_CAMPAIGN_ID", error="Each campaign ID may appear only once.")
         return respond(400)
     if any(not valid_uuid(campaign_id) for _, campaign_id in requested):
         body.update(status="INVALID_CAMPAIGN_ID", error="Each campaign ID must be a valid UUID.")
         return respond(400)
 
-    body["campaign_ids"] = {
-        "josh_campaign_id" if label == "Josh Estate" else "michael_campaign_id": campaign_id
-        for label, campaign_id in requested
-    }
+    body["campaign_ids"] = ids_by_parameter
+    body["requested_campaign_ids"] = requested_ids
     body["campaigns"] = [
         build_post_call_campaign_report(label, campaign_id)
         for label, campaign_id in requested
