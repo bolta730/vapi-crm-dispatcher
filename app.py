@@ -1492,6 +1492,7 @@ CALL_QA_SAFETY = [
 
 MAX_QA_CALL_IDS = 50
 MAX_POST_CALL_CAMPAIGN_IDS = 50
+MAX_POST_CALL_CAMPAIGN_WORKERS = 4
 MAX_QA_TRANSCRIPT_CHARS = 30000
 MAX_QA_MESSAGES = 250
 MAX_QA_MESSAGE_CHARS = 4000
@@ -1702,6 +1703,26 @@ def build_post_call_campaign_report(batch_label, campaign_id):
     }
 
 
+def failed_post_call_campaign_report(batch_label, campaign_id, error=None):
+    """Return a stable JSON report when one campaign cannot be assembled."""
+    return {
+        "campaign_id": campaign_id,
+        "batch_label": batch_label,
+        "campaign_name": None,
+        "campaign_status": "READ_ERROR",
+        "total_calls": 0,
+        "completed_calls": 0,
+        "voicemail_count": None,
+        "answered_human_calls": None,
+        "failed_calls": 0,
+        "total_duration_seconds": None,
+        "average_duration_seconds": None,
+        "call_ids": [],
+        "calls": [],
+        "error_messages": [error or "Unable to build this campaign report."],
+    }
+
+
 @app.route("/post-call-report", methods=["GET"])
 def post_call_report():
     """Read-only AM/PM campaign results with phone numbers always masked."""
@@ -1763,10 +1784,32 @@ def post_call_report():
 
     body["campaign_ids"] = ids_by_parameter
     body["requested_campaign_ids"] = requested_ids
-    body["campaigns"] = [
-        build_post_call_campaign_report(label, campaign_id)
-        for label, campaign_id in requested
-    ]
+    # Campaigns used to be assembled serially. A long multi-campaign report could
+    # therefore exceed the web worker timeout and surface as an HTML 500. Keep a
+    # small, bounded pool so multi-ID reports finish promptly without flooding
+    # the read-only Vapi API, and preserve the order requested by the caller.
+    reports_by_id = {}
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_POST_CALL_CAMPAIGN_WORKERS, len(requested))
+    ) as executor:
+        futures = {
+            executor.submit(build_post_call_campaign_report, label, campaign_id): (
+                label,
+                campaign_id,
+            )
+            for label, campaign_id in requested
+        }
+        for future in as_completed(futures):
+            label, campaign_id = futures[future]
+            try:
+                report = future.result()
+                if not isinstance(report, dict):
+                    raise TypeError("Campaign report was not a JSON object.")
+            except Exception:
+                report = failed_post_call_campaign_report(label, campaign_id)
+            reports_by_id[campaign_id] = report
+
+    body["campaigns"] = [reports_by_id[campaign_id] for _, campaign_id in requested]
     if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
         body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         return respond(502)

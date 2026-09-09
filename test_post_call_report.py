@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -102,6 +103,44 @@ class PostCallReportTests(unittest.TestCase):
         self.assertEqual(body["requested_campaign_ids"], ids)
         self.assertEqual([item["campaign_id"] for item in body["campaigns"]], ids)
         self.assertEqual(build_report.call_count, 4)
+
+    @patch.object(dispatcher, "build_post_call_campaign_report")
+    def test_sixteen_campaigns_are_bounded_parallel_and_keep_request_order(self, build_report):
+        ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(16)]
+
+        def delayed_report(label, campaign_id):
+            time.sleep(0.05)
+            return {
+                "campaign_id": campaign_id,
+                "batch_label": label,
+                "campaign_status": "ended",
+            }
+
+        build_report.side_effect = delayed_report
+        started = time.monotonic()
+        response = self.client.get(f"/post-call-report?campaign_ids={','.join(ids)}")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["campaign_id"] for item in response.get_json()["campaigns"]],
+            ids,
+        )
+        self.assertEqual(build_report.call_count, 16)
+        self.assertLess(elapsed, 0.6)
+
+    @patch.object(dispatcher, "build_post_call_campaign_report")
+    def test_campaign_build_exception_returns_json_partial_report(self, build_report):
+        build_report.side_effect = RuntimeError("unexpected private upstream detail")
+
+        response = self.client.get(f"/post-call-report?campaign_ids={JOSH_ID}")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.content_type, "application/json")
+        body = response.get_json()
+        self.assertEqual(body["status"], "REPORT_PARTIAL_OR_UNAVAILABLE")
+        self.assertEqual(body["campaigns"][0]["campaign_status"], "READ_ERROR")
+        self.assertNotIn("private upstream detail", response.get_data(as_text=True))
 
     @patch.object(dispatcher, "build_post_call_campaign_report")
     def test_repeated_and_legacy_parameters_are_supported(self, build_report):
