@@ -1492,7 +1492,8 @@ CALL_QA_SAFETY = [
 
 MAX_QA_CALL_IDS = 50
 MAX_POST_CALL_CAMPAIGN_IDS = 50
-MAX_POST_CALL_CAMPAIGN_WORKERS = 4
+MAX_POST_CALL_CAMPAIGN_WORKERS = 16
+MAX_POST_CALL_CALL_WORKERS = 24
 MAX_QA_TRANSCRIPT_CHARS = 30000
 MAX_QA_MESSAGES = 250
 MAX_QA_MESSAGE_CHARS = 4000
@@ -1641,8 +1642,10 @@ def public_call_qa_report(call_id, result):
     }
 
 
-def build_post_call_campaign_report(batch_label, campaign_id):
-    campaign_result = call_vapi_read(f"campaign/{campaign_id}")
+def build_post_call_campaign_report(
+    batch_label, campaign_id, campaign_result=None, call_results=None
+):
+    campaign_result = campaign_result or call_vapi_read(f"campaign/{campaign_id}")
     if not campaign_result.get("ok") or not isinstance(campaign_result.get("data"), dict):
         return {
             "campaign_id": campaign_id,
@@ -1663,7 +1666,7 @@ def build_post_call_campaign_report(batch_label, campaign_id):
     campaign = campaign_result["data"]
     call_ids = [call_id for call_id in campaign_call_ids(campaign) if isinstance(call_id, str)]
     calls = []
-    if call_ids:
+    if call_ids and call_results is None:
         with ThreadPoolExecutor(max_workers=min(8, len(call_ids))) as executor:
             futures = {
                 executor.submit(call_vapi_read, f"call/{call_id}"): call_id
@@ -1675,6 +1678,15 @@ def build_post_call_campaign_report(batch_label, campaign_id):
                     calls.append(public_call_report(call_id, future.result()))
                 except Exception:
                     calls.append(public_call_report(call_id, {"ok": False}))
+    elif call_ids:
+        calls = [
+            public_call_report(
+                call_id,
+                call_results.get(call_id, {"ok": False, "error": "Unable to read call details."}),
+            )
+            for call_id in call_ids
+        ]
+    if calls:
         order = {call_id: index for index, call_id in enumerate(call_ids)}
         calls.sort(key=lambda item: order.get(item["call_id"], len(order)))
 
@@ -1721,6 +1733,66 @@ def failed_post_call_campaign_report(batch_label, campaign_id, error=None):
         "calls": [],
         "error_messages": [error or "Unable to build this campaign report."],
     }
+
+
+def build_post_call_campaign_reports(requested):
+    """Fetch campaigns and calls in two bounded read-only batches."""
+    campaign_results = {}
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_POST_CALL_CAMPAIGN_WORKERS, len(requested))
+    ) as executor:
+        futures = {
+            executor.submit(call_vapi_read, f"campaign/{campaign_id}"): campaign_id
+            for _, campaign_id in requested
+        }
+        for future in as_completed(futures):
+            campaign_id = futures[future]
+            try:
+                campaign_results[campaign_id] = future.result()
+            except Exception:
+                campaign_results[campaign_id] = {"ok": False}
+
+    call_ids = []
+    for _, campaign_id in requested:
+        result = campaign_results[campaign_id]
+        campaign = result.get("data") if isinstance(result, dict) else None
+        if isinstance(campaign, dict):
+            call_ids.extend(
+                call_id
+                for call_id in campaign_call_ids(campaign)
+                if isinstance(call_id, str) and call_id not in call_ids
+            )
+
+    call_results = {}
+    if call_ids:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_POST_CALL_CALL_WORKERS, len(call_ids))
+        ) as executor:
+            futures = {
+                executor.submit(call_vapi_read, f"call/{call_id}"): call_id
+                for call_id in call_ids
+            }
+            for future in as_completed(futures):
+                call_id = futures[future]
+                try:
+                    call_results[call_id] = future.result()
+                except Exception:
+                    call_results[call_id] = {"ok": False}
+
+    reports = []
+    for label, campaign_id in requested:
+        try:
+            reports.append(
+                build_post_call_campaign_report(
+                    label,
+                    campaign_id,
+                    campaign_result=campaign_results[campaign_id],
+                    call_results=call_results,
+                )
+            )
+        except Exception:
+            reports.append(failed_post_call_campaign_report(label, campaign_id))
+    return reports
 
 
 @app.route("/post-call-report", methods=["GET"])
@@ -1784,32 +1856,7 @@ def post_call_report():
 
     body["campaign_ids"] = ids_by_parameter
     body["requested_campaign_ids"] = requested_ids
-    # Campaigns used to be assembled serially. A long multi-campaign report could
-    # therefore exceed the web worker timeout and surface as an HTML 500. Keep a
-    # small, bounded pool so multi-ID reports finish promptly without flooding
-    # the read-only Vapi API, and preserve the order requested by the caller.
-    reports_by_id = {}
-    with ThreadPoolExecutor(
-        max_workers=min(MAX_POST_CALL_CAMPAIGN_WORKERS, len(requested))
-    ) as executor:
-        futures = {
-            executor.submit(build_post_call_campaign_report, label, campaign_id): (
-                label,
-                campaign_id,
-            )
-            for label, campaign_id in requested
-        }
-        for future in as_completed(futures):
-            label, campaign_id = futures[future]
-            try:
-                report = future.result()
-                if not isinstance(report, dict):
-                    raise TypeError("Campaign report was not a JSON object.")
-            except Exception:
-                report = failed_post_call_campaign_report(label, campaign_id)
-            reports_by_id[campaign_id] = report
-
-    body["campaigns"] = [reports_by_id[campaign_id] for _, campaign_id in requested]
+    body["campaigns"] = build_post_call_campaign_reports(requested)
     if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
         body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         return respond(502)

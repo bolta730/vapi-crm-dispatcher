@@ -90,7 +90,7 @@ class PostCallReportTests(unittest.TestCase):
     @patch.object(dispatcher, "build_post_call_campaign_report")
     def test_comma_separated_campaign_ids_return_all_campaigns(self, build_report):
         ids = [JOSH_ID, SECOND_ID, THIRD_ID, FOURTH_ID]
-        build_report.side_effect = lambda label, campaign_id: {
+        build_report.side_effect = lambda label, campaign_id, **kwargs: {
             "campaign_id": campaign_id,
             "batch_label": label,
             "campaign_status": "ended",
@@ -104,19 +104,16 @@ class PostCallReportTests(unittest.TestCase):
         self.assertEqual([item["campaign_id"] for item in body["campaigns"]], ids)
         self.assertEqual(build_report.call_count, 4)
 
-    @patch.object(dispatcher, "build_post_call_campaign_report")
-    def test_sixteen_campaigns_are_bounded_parallel_and_keep_request_order(self, build_report):
+    @patch.object(dispatcher, "call_vapi_read")
+    def test_sixteen_campaigns_are_bounded_parallel_and_keep_request_order(self, vapi_read):
         ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(16)]
 
-        def delayed_report(label, campaign_id):
+        def delayed_read(path):
             time.sleep(0.05)
-            return {
-                "campaign_id": campaign_id,
-                "batch_label": label,
-                "campaign_status": "ended",
-            }
+            campaign_id = path.rsplit("/", 1)[-1]
+            return {"ok": True, "data": {"id": campaign_id, "status": "ended"}}
 
-        build_report.side_effect = delayed_report
+        vapi_read.side_effect = delayed_read
         started = time.monotonic()
         response = self.client.get(f"/post-call-report?campaign_ids={','.join(ids)}")
         elapsed = time.monotonic() - started
@@ -126,7 +123,7 @@ class PostCallReportTests(unittest.TestCase):
             [item["campaign_id"] for item in response.get_json()["campaigns"]],
             ids,
         )
-        self.assertEqual(build_report.call_count, 16)
+        self.assertEqual(vapi_read.call_count, 16)
         self.assertLess(elapsed, 0.6)
 
     @patch.object(dispatcher, "build_post_call_campaign_report")
@@ -144,7 +141,7 @@ class PostCallReportTests(unittest.TestCase):
 
     @patch.object(dispatcher, "build_post_call_campaign_report")
     def test_repeated_and_legacy_parameters_are_supported(self, build_report):
-        build_report.side_effect = lambda label, campaign_id: {
+        build_report.side_effect = lambda label, campaign_id, **kwargs: {
             "campaign_id": campaign_id,
             "batch_label": label,
             "campaign_status": "ended",
