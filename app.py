@@ -2,7 +2,8 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from uuid import UUID
+from threading import Lock
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1795,6 +1796,80 @@ def build_post_call_campaign_reports(requested):
     return reports
 
 
+POST_CALL_LABELS = {
+    "josh_campaign_id": "Josh Estate",
+    "michael_campaign_id": "Michael Owner",
+    "campaign_ids": "Campaign",
+}
+REPORT_JOB_MAX_ACTIVE = 20
+REPORT_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+REPORT_JOBS = {}
+REPORT_JOBS_LOCK = Lock()
+
+
+def parse_post_call_campaign_ids(args):
+    if any(key not in POST_CALL_LABELS for key in args):
+        return None, None, (
+            "INVALID_PARAMETERS",
+            "Use only campaign_ids, josh_campaign_id, and michael_campaign_id.",
+        )
+
+    requested = []
+    ids_by_parameter = {}
+    for parameter, label in POST_CALL_LABELS.items():
+        values = []
+        for raw_value in args.getlist(parameter):
+            values.extend(value.strip() for value in raw_value.split(",") if value.strip())
+        if values:
+            ids_by_parameter[parameter] = values
+            requested.extend((label, campaign_id) for campaign_id in values)
+
+    if not requested:
+        return None, None, (
+            "MISSING_CAMPAIGN_IDS",
+            "Provide campaign_ids, josh_campaign_id, michael_campaign_id, or a combination.",
+        )
+    if len(requested) > MAX_POST_CALL_CAMPAIGN_IDS:
+        return None, None, (
+            "TOO_MANY_CAMPAIGN_IDS",
+            f"Provide no more than {MAX_POST_CALL_CAMPAIGN_IDS} campaign IDs per report.",
+        )
+    requested_ids = [campaign_id for _, campaign_id in requested]
+    if len(set(requested_ids)) != len(requested_ids):
+        return None, None, (
+            "DUPLICATE_CAMPAIGN_ID",
+            "Each campaign ID may appear only once.",
+        )
+    if any(not valid_uuid(campaign_id) for campaign_id in requested_ids):
+        return None, None, (
+            "INVALID_CAMPAIGN_ID",
+            "Each campaign ID must be a valid UUID.",
+        )
+    return requested, ids_by_parameter, None
+
+
+def run_post_call_report_job(report_job_id, requested, ids_by_parameter):
+    try:
+        campaigns = build_post_call_campaign_reports(requested)
+        report = {
+            "status": "READ_ONLY_POST_CALL_REPORT",
+            "campaign_ids": ids_by_parameter,
+            "requested_campaign_ids": [campaign_id for _, campaign_id in requested],
+            "campaigns": campaigns,
+            "safety": POST_CALL_SAFETY,
+        }
+        if any(campaign.get("campaign_status") == "READ_ERROR" for campaign in campaigns):
+            report["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS[report_job_id].update(status="COMPLETE", report=report)
+    except Exception:
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS[report_job_id].update(
+                status="FAILED",
+                error="The report job could not be completed.",
+            )
+
+
 @app.route("/post-call-report", methods=["GET"])
 def post_call_report():
     """Read-only AM/PM campaign results with phone numbers always masked."""
@@ -1860,6 +1935,94 @@ def post_call_report():
     if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
         body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         return respond(502)
+    return respond(200)
+
+
+@app.route("/post-call-report-start", methods=["GET"])
+def post_call_report_start():
+    """Start a full read-only report outside the browser request lifecycle."""
+    body = {"status": "INVALID_REQUEST", "safety": POST_CALL_SAFETY}
+
+    def respond(code):
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, code
+
+    requested, ids_by_parameter, validation_error = parse_post_call_campaign_ids(request.args)
+    if validation_error:
+        body.update(status=validation_error[0], error=validation_error[1])
+        return respond(400)
+
+    with REPORT_JOBS_LOCK:
+        active_jobs = sum(
+            job.get("status") == "PROCESSING" for job in REPORT_JOBS.values()
+        )
+        if active_jobs >= REPORT_JOB_MAX_ACTIVE:
+            body.update(
+                status="REPORT_JOB_CAPACITY_REACHED",
+                error="Too many report jobs are currently processing. Try again shortly.",
+            )
+            return respond(503)
+        report_job_id = str(uuid4())
+        REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
+
+    try:
+        REPORT_JOB_EXECUTOR.submit(
+            run_post_call_report_job,
+            report_job_id,
+            requested,
+            ids_by_parameter,
+        )
+    except Exception:
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS.pop(report_job_id, None)
+        body.update(status="REPORT_JOB_START_FAILED", error="The report job could not be started.")
+        return respond(503)
+
+    body.update(
+        status="PROCESSING",
+        report_job_id=report_job_id,
+        requested_campaign_ids=[campaign_id for _, campaign_id in requested],
+        result_url=f"/post-call-report-result?report_job_id={report_job_id}",
+    )
+    return respond(202)
+
+
+@app.route("/post-call-report-result", methods=["GET"])
+def post_call_report_result():
+    """Poll a read-only report job until its complete report is available."""
+    body = {"status": "INVALID_REQUEST", "safety": POST_CALL_SAFETY}
+
+    def respond(code):
+        response = jsonify(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response, code
+
+    if set(request.args) != {"report_job_id"} or len(request.args.getlist("report_job_id")) != 1:
+        body.update(
+            status="INVALID_PARAMETERS",
+            error="Provide exactly one report_job_id parameter.",
+        )
+        return respond(400)
+    report_job_id = request.args.get("report_job_id", "").strip()
+    if not valid_uuid(report_job_id):
+        body.update(status="INVALID_REPORT_JOB_ID", error="report_job_id must be a valid UUID.")
+        return respond(400)
+
+    with REPORT_JOBS_LOCK:
+        job = REPORT_JOBS.get(report_job_id)
+        job = dict(job) if job else None
+    if job is None:
+        body.update(status="REPORT_JOB_NOT_FOUND", error="No report job was found for that ID.")
+        return respond(404)
+    if job["status"] == "PROCESSING":
+        body.update(status="PROCESSING", report_job_id=report_job_id)
+        return respond(202)
+    if job["status"] == "FAILED":
+        body.update(status="FAILED", report_job_id=report_job_id, error=job["error"])
+        return respond(500)
+
+    body.update(status="COMPLETE", report_job_id=report_job_id, report=job["report"])
     return respond(200)
 
 

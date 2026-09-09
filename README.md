@@ -50,8 +50,20 @@ Examples:
 
 `/post-call-report?campaign_ids=ID1&campaign_ids=ID2`
 
+For large daily reports, start a background report job so the full Vapi read is
+not limited by one browser request:
+
+`/post-call-report-start?campaign_ids=ID1,ID2,ID3`
+
+The JSON response has `status: "PROCESSING"`, a `report_job_id`, and a
+`result_url`. Poll that URL (equivalent to the following) until it returns
+`status: "COMPLETE"` and the full report in `report`:
+
+`/post-call-report-result?report_job_id=REPORT_JOB_ID`
+
 This route contains only Vapi GET requests. It cannot create campaigns, place
-calls, or update Vapi configuration. A request with no campaign IDs returns a
+calls, or update Vapi configuration. The job endpoints use the same read-only
+report builder and safety guarantees. A request with no campaign IDs returns a
 helpful 400 response before reading Vapi.
 
 ## Read-only call QA report

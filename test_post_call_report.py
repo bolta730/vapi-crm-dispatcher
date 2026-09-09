@@ -17,6 +17,8 @@ class PostCallReportTests(unittest.TestCase):
     def setUp(self):
         dispatcher.app.config["TESTING"] = True
         self.client = dispatcher.app.test_client()
+        with dispatcher.REPORT_JOBS_LOCK:
+            dispatcher.REPORT_JOBS.clear()
 
     @patch.object(dispatcher.requests, "post")
     @patch.object(dispatcher.requests, "get")
@@ -171,6 +173,102 @@ class PostCallReportTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["status"], "DUPLICATE_CAMPAIGN_ID")
         build_report.assert_not_called()
+
+
+class PostCallReportJobTests(unittest.TestCase):
+    def setUp(self):
+        dispatcher.app.config["TESTING"] = True
+        self.client = dispatcher.app.test_client()
+        with dispatcher.REPORT_JOBS_LOCK:
+            dispatcher.REPORT_JOBS.clear()
+
+    @patch.object(dispatcher.REPORT_JOB_EXECUTOR, "submit")
+    def test_start_returns_job_id_and_schedules_read_only_report(self, submit):
+        response = self.client.get(
+            f"/post-call-report-start?campaign_ids={JOSH_ID},{SECOND_ID}"
+        )
+
+        self.assertEqual(response.status_code, 202)
+        body = response.get_json()
+        self.assertEqual(body["status"], "PROCESSING")
+        self.assertTrue(dispatcher.valid_uuid(body["report_job_id"]))
+        self.assertEqual(body["requested_campaign_ids"], [JOSH_ID, SECOND_ID])
+        self.assertEqual(
+            body["result_url"],
+            f"/post-call-report-result?report_job_id={body['report_job_id']}",
+        )
+        submit.assert_called_once()
+        self.assertIs(submit.call_args.args[0], dispatcher.run_post_call_report_job)
+
+    def test_result_returns_processing_then_complete_full_large_report(self):
+        ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(16)]
+        requested = [("Campaign", campaign_id) for campaign_id in ids]
+        report_job_id = "dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb"
+        with dispatcher.REPORT_JOBS_LOCK:
+            dispatcher.REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
+
+        processing = self.client.get(
+            f"/post-call-report-result?report_job_id={report_job_id}"
+        )
+        self.assertEqual(processing.status_code, 202)
+        self.assertEqual(processing.get_json()["status"], "PROCESSING")
+
+        full_campaigns = [
+            {
+                "campaign_id": campaign_id,
+                "campaign_status": "ended",
+                "calls": [{"call_id": f"call-{index}"}],
+            }
+            for index, campaign_id in enumerate(ids)
+        ]
+        with patch.object(
+            dispatcher, "build_post_call_campaign_reports", return_value=full_campaigns
+        ) as build_reports:
+            dispatcher.run_post_call_report_job(
+                report_job_id,
+                requested,
+                {"campaign_ids": ids},
+            )
+
+        complete = self.client.get(
+            f"/post-call-report-result?report_job_id={report_job_id}"
+        )
+        self.assertEqual(complete.status_code, 200)
+        body = complete.get_json()
+        self.assertEqual(body["status"], "COMPLETE")
+        self.assertEqual(body["report"]["requested_campaign_ids"], ids)
+        self.assertEqual(len(body["report"]["campaigns"]), 16)
+        self.assertEqual(body["report"]["campaigns"], full_campaigns)
+        self.assertEqual(body["report"]["safety"], dispatcher.POST_CALL_SAFETY)
+        build_reports.assert_called_once_with(requested)
+
+    @patch.object(dispatcher.requests, "post")
+    @patch.object(dispatcher, "build_post_call_campaign_reports")
+    def test_report_job_runner_never_uses_post(self, build_reports, post):
+        report_job_id = "eeeeeeee-ffff-4000-8bbb-cccccccccccc"
+        with dispatcher.REPORT_JOBS_LOCK:
+            dispatcher.REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
+        build_reports.return_value = []
+
+        dispatcher.run_post_call_report_job(
+            report_job_id,
+            [("Campaign", JOSH_ID)],
+            {"campaign_ids": [JOSH_ID]},
+        )
+
+        post.assert_not_called()
+        self.assertEqual(dispatcher.REPORT_JOBS[report_job_id]["status"], "COMPLETE")
+
+    def test_job_endpoints_reject_invalid_parameters_as_json(self):
+        start = self.client.get("/post-call-report-start?campaign_ids=bad")
+        result = self.client.get("/post-call-report-result?report_job_id=bad")
+
+        self.assertEqual(start.status_code, 400)
+        self.assertEqual(start.content_type, "application/json")
+        self.assertEqual(start.get_json()["status"], "INVALID_CAMPAIGN_ID")
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual(result.content_type, "application/json")
+        self.assertEqual(result.get_json()["status"], "INVALID_REPORT_JOB_ID")
 
 
 if __name__ == "__main__":
