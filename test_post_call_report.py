@@ -270,6 +270,146 @@ class PostCallReportJobTests(unittest.TestCase):
         self.assertEqual(result.content_type, "application/json")
         self.assertEqual(result.get_json()["status"], "INVALID_REPORT_JOB_ID")
 
+    @patch.object(dispatcher, "enqueue_post_call_report_job")
+    def test_full_report_page_starts_job_and_polls_behind_the_scenes(self, enqueue):
+        report_job_id = "ffffffff-aaaa-4000-8ccc-dddddddddddd"
+        enqueue.return_value = (report_job_id, None)
+
+        response = self.client.get(
+            f"/post-call-full-report?campaign_ids={JOSH_ID},{SECOND_ID}"
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.content_type, "text/html; charset=utf-8")
+        page = response.get_data(as_text=True)
+        self.assertIn("Post-call full report", page)
+        self.assertIn(
+            f"/post-call-report-result?report_job_id={report_job_id}", page
+        )
+        self.assertIn("setTimeout(poll, 2000)", page)
+        enqueue.assert_called_once()
+
+    @patch.object(dispatcher, "build_post_call_campaign_reports")
+    def test_partial_background_report_is_not_complete(self, build_reports):
+        report_job_id = "aaaaaaaa-ffff-4000-8ddd-eeeeeeeeeeee"
+        with dispatcher.REPORT_JOBS_LOCK:
+            dispatcher.REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
+        build_reports.return_value = [
+            dispatcher.failed_post_call_campaign_report("Campaign", JOSH_ID)
+        ]
+
+        dispatcher.run_post_call_report_job(
+            report_job_id,
+            [("Campaign", JOSH_ID)],
+            {"campaign_ids": [JOSH_ID]},
+        )
+        response = self.client.get(
+            f"/post-call-report-result?report_job_id={report_job_id}"
+        )
+
+        self.assertEqual(response.status_code, 502)
+        body = response.get_json()
+        self.assertEqual(body["status"], "INCOMPLETE")
+        self.assertNotEqual(body["status"], "COMPLETE")
+        self.assertEqual(body["report"]["status"], "REPORT_PARTIAL_OR_UNAVAILABLE")
+
+
+class TranscriptQaDetectionTests(unittest.TestCase):
+    @staticmethod
+    def call(customer_text, agent_text, ended_reason="customer-ended-call"):
+        return {
+            "endedReason": ended_reason,
+            "artifact": {
+                "messages": [
+                    {"role": "user", "message": customer_text},
+                    {"role": "bot", "message": agent_text},
+                ]
+            },
+        }
+
+    def test_screening_voicemail_and_ivr_are_not_real_humans(self):
+        call = self.call(
+            "Record your name and reason for calling. This person can't take your call now. "
+            "After the tone, record your message, then press pound.",
+            "This is Michael from Owner Advance. Am I speaking with the homeowner?",
+        )
+
+        qa = dispatcher.detect_call_qa(call)
+
+        self.assertTrue(qa["qa_detected_voicemail"])
+        self.assertTrue(qa["qa_detected_call_screening_bot"])
+        self.assertTrue(qa["qa_detected_phone_menu_or_ivr"])
+        self.assertFalse(qa["qa_detected_real_human"])
+        self.assertTrue(qa["qa_needs_human_review"])
+
+    def test_phone_menu_business_options_are_not_human(self):
+        call = self.call(
+            "For the company directory press star. For technical support press one. "
+            "For sales press two. For billing press three.",
+            "This is Michael from Owner Advance.",
+        )
+
+        qa = dispatcher.detect_call_qa(call)
+
+        self.assertTrue(qa["qa_detected_phone_menu_or_ivr"])
+        self.assertFalse(qa["qa_detected_real_human"])
+
+    def test_sep_9_problem_patterns_are_flagged(self):
+        wrong_number = dispatcher.detect_call_qa(
+            self.call(
+                "I don't know who that is. You have the wrong person.",
+                "This is Josh from Probate Advance regarding the Brightman Estate Estate.",
+            )
+        )
+        bad_michael = dispatcher.detect_call_qa(
+            self.call(
+                "Hello",
+                "This is Michael from Raymond Ave Roosevelt, New York.",
+            )
+        )
+        internal = dispatcher.detect_call_qa(
+            self.call("Are you still there? Press pound.", "Silence and allow")
+        )
+
+        self.assertTrue(wrong_number["qa_detected_real_human"])
+        self.assertTrue(wrong_number["qa_detected_wrong_number"])
+        self.assertTrue(wrong_number["qa_detected_duplicate_estate"])
+        self.assertTrue(bad_michael["qa_detected_bad_intro"])
+        self.assertTrue(internal["qa_detected_agent_spoke_internal_instruction"])
+
+    def test_summary_counts_misclassified_automation_and_recommendations(self):
+        automated = {
+            "call_id": "call-1",
+            "answered_human": True,
+            **dispatcher.detect_call_qa(
+                self.call("After the tone, press one.", "Silence and allow")
+            ),
+        }
+        human = {
+            "call_id": "call-2",
+            "answered_human": True,
+            **dispatcher.detect_call_qa(
+                self.call(
+                    "I don't know who that is. Wrong number.",
+                    "This is Josh from Probate Advance about the Smith Estate Estate.",
+                )
+            ),
+        }
+
+        summary = dispatcher.build_post_call_qa_summary(
+            [{"calls": [automated, human]}]
+        )
+
+        self.assertEqual(summary["total_calls"], 2)
+        self.assertEqual(summary["problem_calls"]["count"], 2)
+        self.assertEqual(
+            summary["voicemail_or_menu_misclassified_as_human"]["count"], 1
+        )
+        self.assertEqual(summary["duplicate_estate"]["count"], 1)
+        self.assertEqual(summary["agent_said_internal_instruction"]["count"], 1)
+        self.assertEqual(summary["wrong_number_handling_issue"]["count"], 1)
+        self.assertTrue(summary["recommended_next_prompt_fixes"])
+
 
 if __name__ == "__main__":
     unittest.main()

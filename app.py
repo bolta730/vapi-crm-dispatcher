@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
@@ -1521,6 +1521,139 @@ def duration_seconds(call):
         return None
 
 
+QA_VOICEMAIL_PATTERNS = (
+    "can't take your call now",
+    "cannot take your call now",
+    "after the tone",
+    "leave a message",
+    "record your message",
+    "person is not available",
+    "mailbox",
+    "voicemail",
+)
+QA_SCREENING_PATTERNS = (
+    "record your name and reason for calling",
+    "state your name and reason for calling",
+    "i'll see if this person is available",
+    "please stay on the line",
+)
+QA_IVR_PATTERNS = (
+    "press one",
+    "press pound",
+    "company directory",
+    "technical support",
+    "for sales",
+    "for billing",
+    "dial it at any time",
+    "hear these options again",
+)
+QA_WRONG_NUMBER_PATTERNS = (
+    "wrong number",
+    "wrong person",
+    "you have the wrong",
+    "i don't know who",
+    "i dont know who",
+    "don't know where that is",
+    "dont know where that is",
+    "not the homeowner",
+)
+QA_INTERNAL_INSTRUCTION_PATTERNS = (
+    "silence and allow",
+    "wait silently",
+    "remain silent",
+    "do not say anything",
+)
+
+
+def qa_text_by_role(call):
+    artifact = call.get("artifact") if isinstance(call.get("artifact"), dict) else {}
+    messages = artifact.get("messages") or call.get("messages") or []
+    customer_parts = []
+    agent_parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        text = message.get("message") or message.get("content") or message.get("text")
+        if not isinstance(text, str):
+            continue
+        role = str(message.get("role") or message.get("speaker") or "").lower()
+        if role in {"user", "customer"}:
+            customer_parts.append(text)
+        elif role in {"assistant", "bot"}:
+            agent_parts.append(text)
+
+    transcript = artifact.get("transcript") or call.get("transcript") or ""
+    if isinstance(transcript, str) and (not customer_parts or not agent_parts):
+        for line in transcript.splitlines():
+            label, separator, text = line.partition(":")
+            if not separator:
+                continue
+            if label.strip().lower() in {"user", "customer"}:
+                customer_parts.append(text.strip())
+            elif label.strip().lower() in {"ai", "assistant", "bot"}:
+                agent_parts.append(text.strip())
+    return " ".join(customer_parts).lower(), " ".join(agent_parts).lower(), agent_parts
+
+
+def detect_call_qa(call):
+    """Classify conversation evidence independently of Vapi's outcome labels."""
+    customer_text, agent_text, agent_parts = qa_text_by_role(call)
+    ended_reason = str(call.get("endedReason") or "").lower()
+    voicemail = ended_reason == "voicemail" or any(
+        pattern in customer_text for pattern in QA_VOICEMAIL_PATTERNS
+    )
+    screening = any(pattern in customer_text for pattern in QA_SCREENING_PATTERNS)
+    ivr = any(pattern in customer_text for pattern in QA_IVR_PATTERNS)
+    automated = voicemail or screening or ivr
+    customer_has_speech = bool(customer_text.strip())
+    real_human = customer_has_speech and not automated
+    wrong_number = real_human and any(
+        pattern in customer_text for pattern in QA_WRONG_NUMBER_PATTERNS
+    )
+    internal_instruction = any(
+        pattern in agent_text for pattern in QA_INTERNAL_INSTRUCTION_PATTERNS
+    )
+    duplicate_estate = bool(re.search(r"\bestate[\s,.;:-]+estate\b", agent_text))
+
+    first_agent = agent_parts[0].lower() if agent_parts else ""
+    bad_intro = False
+    if "this is michael" in first_agent and "owner advance" not in first_agent:
+        bad_intro = True
+    if "this is josh" in first_agent and "probate advance" not in first_agent:
+        bad_intro = True
+
+    reasons = []
+    if voicemail:
+        reasons.append("Voicemail greeting or mailbox language detected.")
+    if screening:
+        reasons.append("Call-screening bot language detected.")
+    if ivr:
+        reasons.append("Phone menu or IVR language detected.")
+    if wrong_number:
+        reasons.append("Recipient indicated a wrong or unrelated contact.")
+    if internal_instruction:
+        reasons.append("Agent spoke an internal instruction aloud.")
+    if bad_intro:
+        reasons.append("Agent introduction omitted or replaced the required company identity.")
+    if duplicate_estate:
+        reasons.append("Agent said duplicate 'Estate Estate'.")
+    if not customer_has_speech:
+        reasons.append("No customer speech was available for automatic QA.")
+
+    return {
+        "qa_detected_voicemail": voicemail,
+        "qa_detected_call_screening_bot": screening,
+        "qa_detected_phone_menu_or_ivr": ivr,
+        "qa_detected_real_human": real_human,
+        "qa_detected_wrong_number": wrong_number,
+        "qa_detected_agent_spoke_internal_instruction": internal_instruction,
+        "qa_detected_bad_intro": bad_intro,
+        "qa_detected_duplicate_estate": duplicate_estate,
+        "qa_needs_human_review": bool(reasons),
+        "qa_reason": reasons,
+    }
+
+
 def campaign_call_ids(campaign):
     calls = campaign.get("calls") or {}
     if isinstance(calls, dict):
@@ -1542,6 +1675,7 @@ def public_call_report(call_id, result):
             "recording_url_available": False,
             "answered_human": None,
             "error_message": result.get("error", "Unable to read call details."),
+            **detect_call_qa({}),
         }
 
     call = result["data"]
@@ -1581,6 +1715,7 @@ def public_call_report(call_id, result):
             or call.get("recordingUrl")
         ),
         "error_message": call.get("endedMessage"),
+        **detect_call_qa(call),
     }
 
 
@@ -1796,6 +1931,60 @@ def build_post_call_campaign_reports(requested):
     return reports
 
 
+def build_post_call_qa_summary(campaigns):
+    calls = [call for campaign in campaigns for call in campaign.get("calls", [])]
+
+    def matching(predicate):
+        matches = [call for call in calls if predicate(call)]
+        return {"count": len(matches), "call_ids": [call.get("call_id") for call in matches]}
+
+    automated_as_human = lambda call: (
+        call.get("answered_human") is True
+        and (
+            call.get("qa_detected_voicemail")
+            or call.get("qa_detected_call_screening_bot")
+            or call.get("qa_detected_phone_menu_or_ivr")
+        )
+    )
+    categories = {
+        "clean_calls": matching(lambda call: not call.get("qa_needs_human_review")),
+        "problem_calls": matching(lambda call: call.get("qa_needs_human_review")),
+        "voicemail_or_menu_misclassified_as_human": matching(automated_as_human),
+        "duplicate_estate": matching(lambda call: call.get("qa_detected_duplicate_estate")),
+        "agent_said_internal_instruction": matching(
+            lambda call: call.get("qa_detected_agent_spoke_internal_instruction")
+        ),
+        "bad_intro_or_address_issue": matching(lambda call: call.get("qa_detected_bad_intro")),
+        "wrong_number_handling_issue": matching(lambda call: call.get("qa_detected_wrong_number")),
+    }
+    recommendations = []
+    if categories["voicemail_or_menu_misclassified_as_human"]["count"]:
+        recommendations.append(
+            "Add explicit voicemail, call-screening, and IVR branches; never ask qualification questions of automation."
+        )
+    if categories["duplicate_estate"]["count"]:
+        recommendations.append(
+            "Avoid appending the word Estate when the supplied estate name already ends with Estate."
+        )
+    if categories["agent_said_internal_instruction"]["count"]:
+        recommendations.append(
+            "Keep control instructions non-spoken and forbid phrases such as 'silence and allow'."
+        )
+    if categories["bad_intro_or_address_issue"]["count"]:
+        recommendations.append(
+            "Lock the opening identity sentence before introducing any property address."
+        )
+    if categories["wrong_number_handling_issue"]["count"]:
+        recommendations.append(
+            "Acknowledge wrong-number statements politely, suppress further qualification, and end once."
+        )
+    return {
+        "total_calls": len(calls),
+        **categories,
+        "recommended_next_prompt_fixes": recommendations,
+    }
+
+
 POST_CALL_LABELS = {
     "josh_campaign_id": "Josh Estate",
     "michael_campaign_id": "Michael Owner",
@@ -1856,18 +2045,49 @@ def run_post_call_report_job(report_job_id, requested, ids_by_parameter):
             "campaign_ids": ids_by_parameter,
             "requested_campaign_ids": [campaign_id for _, campaign_id in requested],
             "campaigns": campaigns,
+            "qa_summary": build_post_call_qa_summary(campaigns),
             "safety": POST_CALL_SAFETY,
         }
-        if any(campaign.get("campaign_status") == "READ_ERROR" for campaign in campaigns):
+        incomplete = any(
+            campaign.get("campaign_status") == "READ_ERROR" for campaign in campaigns
+        )
+        if incomplete:
             report["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         with REPORT_JOBS_LOCK:
-            REPORT_JOBS[report_job_id].update(status="COMPLETE", report=report)
+            REPORT_JOBS[report_job_id].update(
+                status="INCOMPLETE" if incomplete else "COMPLETE",
+                report=report,
+            )
     except Exception:
         with REPORT_JOBS_LOCK:
             REPORT_JOBS[report_job_id].update(
                 status="FAILED",
                 error="The report job could not be completed.",
             )
+
+
+def enqueue_post_call_report_job(requested, ids_by_parameter):
+    with REPORT_JOBS_LOCK:
+        active_jobs = sum(
+            job.get("status") == "PROCESSING" for job in REPORT_JOBS.values()
+        )
+        if active_jobs >= REPORT_JOB_MAX_ACTIVE:
+            return None, "REPORT_JOB_CAPACITY_REACHED"
+        report_job_id = str(uuid4())
+        REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
+
+    try:
+        REPORT_JOB_EXECUTOR.submit(
+            run_post_call_report_job,
+            report_job_id,
+            requested,
+            ids_by_parameter,
+        )
+    except Exception:
+        with REPORT_JOBS_LOCK:
+            REPORT_JOBS.pop(report_job_id, None)
+        return None, "REPORT_JOB_START_FAILED"
+    return report_job_id, None
 
 
 @app.route("/post-call-report", methods=["GET"])
@@ -1932,6 +2152,7 @@ def post_call_report():
     body["campaign_ids"] = ids_by_parameter
     body["requested_campaign_ids"] = requested_ids
     body["campaigns"] = build_post_call_campaign_reports(requested)
+    body["qa_summary"] = build_post_call_qa_summary(body["campaigns"])
     if any(campaign["campaign_status"] == "READ_ERROR" for campaign in body["campaigns"]):
         body["status"] = "REPORT_PARTIAL_OR_UNAVAILABLE"
         return respond(502)
@@ -1953,30 +2174,16 @@ def post_call_report_start():
         body.update(status=validation_error[0], error=validation_error[1])
         return respond(400)
 
-    with REPORT_JOBS_LOCK:
-        active_jobs = sum(
-            job.get("status") == "PROCESSING" for job in REPORT_JOBS.values()
+    report_job_id, start_error = enqueue_post_call_report_job(requested, ids_by_parameter)
+    if start_error:
+        body.update(
+            status=start_error,
+            error=(
+                "Too many report jobs are currently processing. Try again shortly."
+                if start_error == "REPORT_JOB_CAPACITY_REACHED"
+                else "The report job could not be started."
+            ),
         )
-        if active_jobs >= REPORT_JOB_MAX_ACTIVE:
-            body.update(
-                status="REPORT_JOB_CAPACITY_REACHED",
-                error="Too many report jobs are currently processing. Try again shortly.",
-            )
-            return respond(503)
-        report_job_id = str(uuid4())
-        REPORT_JOBS[report_job_id] = {"status": "PROCESSING"}
-
-    try:
-        REPORT_JOB_EXECUTOR.submit(
-            run_post_call_report_job,
-            report_job_id,
-            requested,
-            ids_by_parameter,
-        )
-    except Exception:
-        with REPORT_JOBS_LOCK:
-            REPORT_JOBS.pop(report_job_id, None)
-        body.update(status="REPORT_JOB_START_FAILED", error="The report job could not be started.")
         return respond(503)
 
     body.update(
@@ -1986,6 +2193,105 @@ def post_call_report_start():
         result_url=f"/post-call-report-result?report_job_id={report_job_id}",
     )
     return respond(202)
+
+
+@app.route("/post-call-full-report", methods=["GET"])
+def post_call_full_report():
+    """One-page full report experience backed by the asynchronous report job."""
+    requested, ids_by_parameter, validation_error = parse_post_call_campaign_ids(request.args)
+    if validation_error:
+        response = jsonify(
+            {
+                "status": validation_error[0],
+                "error": validation_error[1],
+                "safety": POST_CALL_SAFETY,
+            }
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response, 400
+
+    report_job_id, start_error = enqueue_post_call_report_job(requested, ids_by_parameter)
+    if start_error:
+        response = jsonify(
+            {
+                "status": start_error,
+                "error": "The full report job could not be started. Try again shortly.",
+                "safety": POST_CALL_SAFETY,
+            }
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response, 503
+
+    result_url = f"/post-call-report-result?report_job_id={report_job_id}"
+    html = render_template_string(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Post-call full report</title>
+  <style>
+    body { font: 16px/1.45 system-ui, sans-serif; margin: 0; background: #f5f7fa; color: #17202a; }
+    main { max-width: 1100px; margin: 40px auto; padding: 0 20px; }
+    .panel { background: white; border: 1px solid #dfe5ec; border-radius: 12px; padding: 24px; box-shadow: 0 4px 18px #17202a12; }
+    .status { font-weight: 700; color: #3157a4; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
+    .card { background: #f7f9fc; border-radius: 8px; padding: 14px; }
+    .value { display: block; font-size: 1.6rem; font-weight: 750; }
+    pre { overflow: auto; max-height: 65vh; padding: 16px; background: #101820; color: #eaf2f8; border-radius: 8px; }
+    .error { color: #a52222; }
+  </style>
+</head>
+<body><main><div class="panel">
+  <h1>Post-call full report</h1>
+  <p id="status" class="status">PROCESSING — reading all campaign and call records…</p>
+  <div id="summary" class="grid"></div>
+  <pre id="report" hidden></pre>
+</div></main>
+<script>
+const resultUrl = {{ result_url|tojson }};
+const statusNode = document.getElementById('status');
+const summaryNode = document.getElementById('summary');
+const reportNode = document.getElementById('report');
+function card(label, value) {
+  const node = document.createElement('div'); node.className = 'card';
+  const number = document.createElement('span'); number.className = 'value'; number.textContent = value;
+  const text = document.createElement('span'); text.textContent = label;
+  node.append(number, text); return node;
+}
+async function poll() {
+  try {
+    const response = await fetch(resultUrl, {cache: 'no-store'});
+    const data = await response.json();
+    if (data.status === 'PROCESSING') { setTimeout(poll, 2000); return; }
+    if (data.status !== 'COMPLETE') {
+      statusNode.className = 'status error';
+      statusNode.textContent = data.status + ' — ' + (data.error || 'Full report unavailable.');
+      reportNode.hidden = false; reportNode.textContent = JSON.stringify(data, null, 2); return;
+    }
+    const report = data.report; const qa = report.qa_summary || {};
+    statusNode.textContent = 'COMPLETE — full read-only report ready';
+    summaryNode.append(
+      card('campaigns', (report.campaigns || []).length),
+      card('calls', qa.total_calls || 0),
+      card('clean calls', (qa.clean_calls || {}).count || 0),
+      card('problem calls', (qa.problem_calls || {}).count || 0)
+    );
+    reportNode.hidden = false; reportNode.textContent = JSON.stringify(report, null, 2);
+  } catch (error) {
+    statusNode.className = 'status error'; statusNode.textContent = 'Unable to read report status. Retrying…';
+    setTimeout(poll, 3000);
+  }
+}
+poll();
+</script></body></html>
+        """,
+        result_url=result_url,
+    )
+    response = app.response_class(html, status=202, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/post-call-report-result", methods=["GET"])
@@ -2021,6 +2327,14 @@ def post_call_report_result():
     if job["status"] == "FAILED":
         body.update(status="FAILED", report_job_id=report_job_id, error=job["error"])
         return respond(500)
+    if job["status"] == "INCOMPLETE":
+        body.update(
+            status="INCOMPLETE",
+            report_job_id=report_job_id,
+            error="One or more campaign records could not be read; this is not a successful full report.",
+            report=job["report"],
+        )
+        return respond(502)
 
     body.update(status="COMPLETE", report_job_id=report_job_id, report=job["report"])
     return respond(200)

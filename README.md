@@ -61,6 +61,22 @@ The JSON response has `status: "PROCESSING"`, a `report_job_id`, and a
 
 `/post-call-report-result?report_job_id=REPORT_JOB_ID`
 
+For the simplest browser experience, use the all-in-one page. It starts the
+same background job, displays `PROCESSING`, polls automatically, and renders
+the complete report when ready:
+
+`/post-call-full-report?campaign_ids=ID1,ID2,ID3`
+
+Each call includes transcript/message-derived QA fields for voicemail,
+call-screening bots, phone menus/IVRs, real humans, wrong numbers, spoken
+internal instructions, bad introductions, duplicate `Estate Estate`, human
+review need, and readable reasons. The report-level `qa_summary` provides
+counts, affected call IDs, and recommended next prompt fixes. These QA signals
+do not rely on Vapi's voicemail or answered-human labels alone.
+
+A job with any unreadable campaign is returned as `INCOMPLETE`, not
+`COMPLETE`, and includes the partial data only for troubleshooting.
+
 This route contains only Vapi GET requests. It cannot create campaigns, place
 calls, or update Vapi configuration. The job endpoints use the same read-only
 report builder and safety guarantees. A request with no campaign IDs returns a
